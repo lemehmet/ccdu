@@ -1,0 +1,22 @@
+[package]
+name = "ccdu-core"
+description = "Scanner, tree model, plan engine and journaled executor for ccdu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossbeam-channel = "0.5.16"
+libc = "0.2.189"
+rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
