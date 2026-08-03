@@ -73,8 +73,28 @@ fn scan_phase(
     })
 }
 
+/// Browse a tree that was loaded or fetched rather than scanned here and now.
+///
+/// `read_only` explains why staging is refused; a tree from another machine or another moment
+/// describes paths this process cannot safely act on.
+pub fn browse_tree(tree: Tree, read_only: Option<String>) -> io::Result<()> {
+    let mut terminal = ratatui::init();
+    let result = browse_with(&mut terminal, tree, read_only);
+    ratatui::restore();
+    result
+}
+
 fn browse(terminal: &mut DefaultTerminal, tree: Tree) -> io::Result<()> {
+    browse_with(terminal, tree, None)
+}
+
+fn browse_with(
+    terminal: &mut DefaultTerminal,
+    tree: Tree,
+    read_only: Option<String>,
+) -> io::Result<()> {
     let mut app = App::new(tree);
+    app.read_only = read_only;
     let mut list_state = ListState::default();
 
     while !app.quit {

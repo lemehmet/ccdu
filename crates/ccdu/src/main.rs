@@ -9,11 +9,14 @@ use anyhow::{Context, Result};
 use ccdu_core::dup::{find_duplicates, shares_inode, total_wasted, DupOptions};
 use ccdu_core::exec::journal::Event;
 use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, FaultFn, FaultPoint, Verify};
+use ccdu_core::export::{self, Format};
 use ccdu_core::format::{format_time, human_size};
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
 use ccdu_core::plan::store::Store;
 use ccdu_core::plan::{validate, Severity, ValidateOptions};
 use ccdu_core::scan::{scan, Progress, ScanOptions};
+use ccdu_remote::client::scan_with_ncdu;
+use ccdu_remote::{Remote, Target};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
@@ -26,6 +29,11 @@ use clap::{Args, Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Serve scan requests on standard input and output. Run over ssh by the remote support; not
+    /// meant to be typed.
+    #[arg(long, hide = true, exclusive = true)]
+    agent: bool,
 
     #[command(flatten)]
     scan: ScanArgs,
@@ -112,10 +120,45 @@ impl From<VerifyArg> for Verify {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FormatArg {
+    /// ccdu's own format: exact and compact.
+    Ccdu,
+    /// ncdu's JSON export, readable by `ncdu -f`.
+    NcduJson,
+}
+
+impl From<FormatArg> for Format {
+    fn from(f: FormatArg) -> Format {
+        match f {
+            FormatArg::Ccdu => Format::Native,
+            FormatArg::NcduJson => Format::NcduJson,
+        }
+    }
+}
+
 #[derive(Args, Clone)]
 struct ScanArgs {
-    /// Directory to scan.
+    /// Directory to scan. `ssh://host/path` or `host:path` scans on another machine.
     path: Option<PathBuf>,
+
+    /// Load a saved scan instead of walking the filesystem. Reads ccdu and ncdu dumps alike;
+    /// `-` means standard input.
+    #[arg(short = 'f', long = "file", value_name = "FILE", conflicts_with = "path")]
+    file: Option<PathBuf>,
+
+    /// Write the scan here instead of showing it. `-` means standard output.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Format for --output.
+    #[arg(long, value_enum, default_value_t = FormatArg::Ccdu)]
+    format: FormatArg,
+
+    /// Path to ccdu on the remote host. Useful when it is installed somewhere ssh's
+    /// non-interactive PATH does not reach.
+    #[arg(long, default_value = "ccdu", value_name = "PATH")]
+    remote_ccdu: String,
 
     /// Stay on one filesystem: do not descend into other mounts.
     #[arg(short = 'x', long)]
@@ -140,6 +183,12 @@ struct ScanArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.agent {
+        // Nothing but frames may reach stdout from here on.
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        return ccdu_remote::agent::serve(stdin.lock(), stdout.lock()).context("serving as agent");
+    }
     match cli.command {
         Some(Command::Scan(args)) => report(args),
         Some(Command::Plan { cmd }) => plan_command(cmd),
@@ -478,10 +527,63 @@ fn plan_command(cmd: PlanCmd) -> Result<()> {
     }
 }
 
+/// Fetch a tree from another machine, preferring its ccdu and falling back to its ncdu.
+fn scan_remote(target: &Target, args: &ScanArgs) -> Result<ccdu_core::model::Tree> {
+    let threads = args.threads.unwrap_or(8);
+    let exclude = args.excludes.clone();
+
+    match Remote::connect(target.agent_command(&args.remote_ccdu)) {
+        Ok(mut remote) => {
+            eprintln!("scanning {} on {} (ccdu {})", target.path, remote.host, remote.version);
+            let tree = remote
+                .scan(&target.path, args.one_file_system, threads, exclude, None)
+                .with_context(|| format!("scanning {} on {}", target.path, target.host))?;
+            Ok(tree)
+        }
+        Err(e) => {
+            // A host with no ccdu on it is the common case, not a failure. ncdu is the fallback
+            // because it is the tool that is already there.
+            eprintln!("no ccdu agent on {} ({e}); trying ncdu", target.host);
+            scan_with_ncdu(target)
+                .with_context(|| format!("scanning {} on {} with ncdu", target.path, target.host))
+        }
+    }
+}
+
 /// Default behaviour: scan and open the browser.
 fn browse(args: ScanArgs) -> Result<()> {
+    // Writing a scan and browsing one are different jobs; `-o` means the former even without the
+    // `scan` subcommand, so `ccdu /path -o dump` does what it looks like.
+    if args.output.is_some() {
+        return report(args);
+    }
+    if let Some(file) = args.file.clone() {
+        let tree = load(&file)?;
+        let why = format!(
+            "loaded from {}; stage against a live scan, or run ccdu where the files are",
+            file.display()
+        );
+        return ccdu_tui::browse_tree(tree, Some(why)).context("terminal interface");
+    }
+    if let Some(target) = remote_target(&args) {
+        let tree = scan_remote(&target, &args)?;
+        let why = format!(
+            "these files are on {}; run `ccdu {}` there to change them",
+            target.host, target.path
+        );
+        return ccdu_tui::browse_tree(tree, Some(why)).context("terminal interface");
+    }
     let (path, opts) = prepare(&args)?;
     ccdu_tui::run(path, opts).context("terminal interface")
+}
+
+/// A path argument that names another machine rather than a local directory.
+fn remote_target(args: &ScanArgs) -> Option<Target> {
+    Target::parse(args.path.as_ref()?.to_str()?)
+}
+
+fn load(file: &std::path::Path) -> Result<ccdu_core::model::Tree> {
+    export::read_path(file).with_context(|| format!("reading {}", file.display()))
 }
 
 /// Resolve the scan root and turn command line flags into scan options.
@@ -503,16 +605,35 @@ fn prepare(args: &ScanArgs) -> Result<(PathBuf, ScanOptions)> {
 /// Headless mode: scan and print a summary, for scripts and for machines without a usable
 /// terminal.
 fn report(args: ScanArgs) -> Result<()> {
-    let (path, opts) = prepare(&args)?;
-
-    let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
-    let reporter = std::thread::spawn(move || report_progress(rx));
-
     let started = Instant::now();
-    let tree = scan(&path, &opts, Some(&tx), None)
-        .with_context(|| format!("scanning {}", path.display()))?;
-    drop(tx);
-    reporter.join().ok();
+    let tree = if let Some(file) = &args.file {
+        load(file)?
+    } else if let Some(target) = remote_target(&args) {
+        scan_remote(&target, &args)?
+    } else {
+        let (path, opts) = prepare(&args)?;
+        let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
+        let reporter = std::thread::spawn(move || report_progress(rx));
+        let tree = scan(&path, &opts, Some(&tx), None)
+            .with_context(|| format!("scanning {}", path.display()))?;
+        drop(tx);
+        reporter.join().ok();
+        tree
+    };
+
+    if let Some(output) = &args.output {
+        let format: Format = args.format.into();
+        export::write_path(&tree, output, format)
+            .with_context(|| format!("writing {}", output.display()))?;
+        // To stderr, so `-o -` stays a clean pipe.
+        eprintln!(
+            "wrote {} entries as {} to {}",
+            tree.node(ROOT).items,
+            format.name(),
+            output.display()
+        );
+        return Ok(());
+    }
 
     print_report(&tree, &args, started.elapsed());
     Ok(())

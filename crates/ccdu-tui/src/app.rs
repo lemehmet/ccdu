@@ -228,6 +228,9 @@ pub struct App {
     /// Show the treemap beside the listing.
     pub show_treemap: bool,
     pub dupes: Option<Dupes>,
+    /// Why this tree cannot be changed from here, if it cannot. Set for trees that were loaded or
+    /// fetched rather than scanned: their paths describe another machine or another moment.
+    pub read_only: Option<String>,
 
     remembered: HashMap<NodeId, usize>,
 }
@@ -286,6 +289,7 @@ impl App {
             stale: false,
             show_treemap: false,
             dupes: None,
+            read_only: None,
             remembered: HashMap::new(),
         };
         app.rebuild_rows();
@@ -677,6 +681,9 @@ impl App {
     /// Read the entry's current identity and stage it. This is the only filesystem access
     /// staging performs, and it is what the executor will later re-check.
     fn record(&mut self, id: NodeId, kind: StagedKind) -> Result<(), String> {
+        if let Some(reason) = &self.read_only {
+            return Err(reason.clone());
+        }
         let path = self.tree.path_of(id);
         let ident =
             Ident::of(&path).map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
@@ -1501,6 +1508,23 @@ mod tests {
 
         app.apply(Action::ToggleTreemap);
         assert!(!app.show_treemap);
+    }
+
+    #[test]
+    fn a_read_only_tree_refuses_staging_and_says_why() {
+        let (dir, mut app) = fixture();
+        app.read_only = Some("these files are on server".to_string());
+
+        app.apply(Action::StageDelete);
+        assert!(app.staged.is_empty(), "a tree we cannot act on was staged against");
+        assert_eq!(app.status.as_deref(), Some("these files are on server"));
+
+        // A move is refused for the same reason, at the same point.
+        app.apply(Action::StageMove);
+        type_in(&mut app, "/mnt/elsewhere");
+        app.apply(Action::Submit);
+        assert!(app.staged.is_empty());
+        assert!(dir.path().join("big").exists());
     }
 
     #[test]

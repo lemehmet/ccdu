@@ -6,6 +6,7 @@
 
 pub mod dup;
 pub mod exec;
+pub mod export;
 pub mod format;
 pub mod model;
 pub mod plan;

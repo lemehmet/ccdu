@@ -208,6 +208,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ccdu-core",
+ "ccdu-remote",
  "ccdu-tui",
  "clap",
  "crossbeam-channel",
@@ -234,6 +235,11 @@ name = "ccdu-remote"
 version = "0.1.0"
 dependencies = [
  "ccdu-core",
+ "crossbeam-channel",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

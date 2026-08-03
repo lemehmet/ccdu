@@ -18,14 +18,17 @@ Early development. See the milestone table below.
 | M4 | Executor: deletes, journal, pause/resume | done |
 | M5 | Moves: same-fs, reflink, cross-device | done |
 | M6 | Treemap panel, duplicate detection | done |
-| M7 | ncdu import/export, SSH agent | |
+| M7 | ncdu import/export, SSH agent | done |
 
 ## Try it
 
 ```sh
-cargo run --release -- /some/path            # scan, then browse
-cargo run --release -- -x -t8 /              # one filesystem, 8 threads
-cargo run --release -- scan --top 30 /usr    # headless: summary + largest entries
+ccdu /some/path              # scan, then browse
+ccdu -x -t8 /                # one filesystem, 8 threads
+ccdu scan --top 30 /usr      # headless: summary + largest entries
+ccdu ssh://server/var        # scan on another machine, browse here
+ccdu /some/path -o dump      # save the scan
+ccdu -f dump                 # browse a saved scan
 ```
 
 A long scan can be cut short with `q` — you drop straight into the browser with whatever was
@@ -184,6 +187,36 @@ they were skipped rather than passing vacuously.
 Sizes are `st_blocks * 512` (what freeing the file actually returns) unless you press `a`, and
 hardlinked files are counted once. `ccdu` matches `du -s --block-size=1` on the trees it has been
 checked against, at roughly a third of the wall time on 8 threads.
+
+## Saving, sharing, and other machines
+
+A scan can be written out and read back, in ccdu's own format or ncdu's:
+
+```sh
+ccdu /usr -o usr.ccdu                      # exact and compact
+ccdu /usr -o - --format ncdu-json | zstd   # readable by `ncdu -f`
+ccdu -f usr.ccdu                           # either format; `-` reads stdin
+```
+
+The format is worked out from the file's first bytes, so neither naming conventions nor a flag are
+needed, and it works on a pipe. Both readers treat their input as untrusted: a file claiming a
+node's parent lives at index four billion gets an error, not a panic somewhere much later.
+
+Interoperability is checked against the real thing rather than against assumptions — `ncdu 1.19`
+and `ccdu` report the same 696.7 MiB and 50 838 items for `/usr/share` in both directions.
+
+`ccdu ssh://host/path` runs `ccdu --agent` over ssh: the remote walks the filesystem, where the
+files are, and sends back the finished tree. If that host has no ccdu, it falls back to
+`ncdu -o-` — a host with ncdu on it is the common case, not a failure.
+
+```
+$ ccdu ssh://server/var/log
+no ccdu agent on server (the remote said nothing; ccdu may not be installed or on its PATH); trying ncdu
+```
+
+Use `--remote-ccdu /path/to/ccdu` when it is installed somewhere ssh's non-interactive `PATH` does
+not reach. A tree fetched from another machine is browsable but not stageable — its paths describe
+a filesystem this process cannot safely act on, and it says so rather than failing later.
 
 ## Layout
 

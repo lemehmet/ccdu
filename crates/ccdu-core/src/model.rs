@@ -96,8 +96,9 @@ pub struct Node {
     pub next_sibling: NodeId,
     /// Number of entries in this subtree, excluding the node itself.
     pub items: u32,
-    name_off: u32,
-    name_len: u16,
+    // Visible within the crate so the export format can write and check them directly.
+    pub(crate) name_off: u32,
+    pub(crate) name_len: u16,
     pub flags: u16,
 }
 
@@ -112,6 +113,8 @@ impl Node {
 }
 
 /// A scanned directory tree.
+///
+/// `Debug` deliberately omits the arena: printing millions of nodes is never what anybody meant.
 pub struct Tree {
     nodes: Vec<Node>,
     names: Vec<u8>,
@@ -120,6 +123,17 @@ pub struct Tree {
     pub errors: u64,
     /// The scan was stopped early, so these totals are a lower bound on what is really there.
     pub cancelled: bool,
+}
+
+impl std::fmt::Debug for Tree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tree")
+            .field("root", &self.root_path)
+            .field("nodes", &self.nodes.len())
+            .field("errors", &self.errors)
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
 }
 
 impl Tree {
@@ -240,6 +254,52 @@ impl Tree {
     /// Bytes used by the arena itself, for reporting.
     pub fn memory_bytes(&self) -> usize {
         self.nodes.capacity() * std::mem::size_of::<Node>() + self.names.capacity()
+    }
+
+    /// The raw arena, for serialisation. Indices are meaningful only alongside [`Tree::raw_names`].
+    pub fn raw_nodes(&self) -> &[Node] {
+        &self.nodes
+    }
+
+    pub fn raw_names(&self) -> &[u8] {
+        &self.names
+    }
+
+    /// Rebuild a tree from its parts.
+    ///
+    /// Returns an error rather than a corrupt tree when the pieces do not fit: this is how
+    /// untrusted files enter the program, and an out-of-range index here would be a panic or
+    /// worse somewhere much further away.
+    pub fn from_raw(
+        root_path: PathBuf,
+        nodes: Vec<Node>,
+        names: Vec<u8>,
+        errors: u64,
+        cancelled: bool,
+    ) -> Result<Tree, String> {
+        if nodes.is_empty() {
+            return Err("a tree must have at least a root".to_string());
+        }
+        let count = nodes.len() as u64;
+        for (i, node) in nodes.iter().enumerate() {
+            let end = node.name_off as u64 + node.name_len as u64;
+            if end > names.len() as u64 {
+                return Err(format!("node {i} names bytes {end} of {}", names.len()));
+            }
+            for (label, link) in [
+                ("parent", node.parent),
+                ("first child", node.first_child),
+                ("sibling", node.next_sibling),
+            ] {
+                if link != NO_NODE && link as u64 >= count {
+                    return Err(format!("node {i} has {label} {link}, past the end at {count}"));
+                }
+            }
+        }
+        if nodes[ROOT as usize].parent != NO_NODE {
+            return Err("the root must have no parent".to_string());
+        }
+        Ok(Tree { nodes, names, root_path, errors, cancelled })
     }
 
     pub fn children(&self, id: NodeId) -> Children<'_> {
