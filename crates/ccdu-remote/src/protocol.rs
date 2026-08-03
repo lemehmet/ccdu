@@ -6,7 +6,8 @@
 
 use std::io::{self, Read, Write};
 
-use ccdu_core::plan::Plan;
+use ccdu_core::exec::{ExecEvent, Outcome, RunState};
+use ccdu_core::plan::{Ident, Plan};
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the messages change incompatibly. Both ends check on connect, so a mismatch is a
@@ -36,6 +37,16 @@ pub enum Request {
     SavePlan {
         plan: Box<Plan>,
     },
+    /// Read the identity of some paths, so a tree fetched from here can be staged against.
+    /// Staging records what an entry looked like, and only the machine holding it can say.
+    Identify {
+        paths: Vec<String>,
+    },
+    /// Run a stored plan. Progress is streamed back as it happens.
+    Apply {
+        id: String,
+        dry_run: bool,
+    },
     Bye,
 }
 
@@ -57,6 +68,17 @@ pub enum Response {
     PlanSaved {
         id: String,
         path: String,
+    },
+    /// One entry per requested path, `None` where it could not be read.
+    Identities {
+        idents: Vec<Option<Ident>>,
+    },
+    Exec {
+        event: ExecEvent,
+    },
+    ExecDone {
+        outcome: Outcome,
+        state: RunState,
     },
     Error {
         message: String,
@@ -143,6 +165,41 @@ mod tests {
         let third = read_frame(&mut cursor).unwrap().unwrap();
         assert_eq!(third, (TAG_TREE, b"CCDU-ish bytes".to_vec()));
         assert!(read_frame(&mut cursor).unwrap().is_none(), "clean end of stream");
+    }
+
+    #[test]
+    fn execution_events_cross_the_wire() {
+        let mut buffer = Vec::new();
+        write_message(
+            &mut buffer,
+            &Response::Exec { event: ExecEvent::Finished { index: 3, freed: 4096 } },
+        )
+        .unwrap();
+        write_message(
+            &mut buffer,
+            &Response::ExecDone {
+                outcome: Outcome { done: 3, freed: 12288, ..Default::default() },
+                state: RunState::Finished,
+            },
+        )
+        .unwrap();
+
+        let mut cursor = io::Cursor::new(&buffer);
+        let (_, body) = read_frame(&mut cursor).unwrap().unwrap();
+        match parse::<Response>(&body).unwrap() {
+            Response::Exec { event: ExecEvent::Finished { index, freed } } => {
+                assert_eq!((index, freed), (3, 4096))
+            }
+            other => panic!("{other:?}"),
+        }
+        let (_, body) = read_frame(&mut cursor).unwrap().unwrap();
+        match parse::<Response>(&body).unwrap() {
+            Response::ExecDone { outcome, state } => {
+                assert_eq!(outcome.freed, 12288);
+                assert_eq!(state, RunState::Finished);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

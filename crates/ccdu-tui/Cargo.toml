@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 ccdu-core = { path = "../ccdu-core" }
+ccdu-remote = { version = "0.1.0", path = "../ccdu-remote" }
 crossbeam-channel = "0.5.16"
 ratatui = "0.30.2"
 

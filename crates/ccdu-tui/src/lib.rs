@@ -79,22 +79,38 @@ fn scan_phase(
 /// describes paths this process cannot safely act on.
 pub fn browse_tree(tree: Tree, read_only: Option<String>) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = browse_with(&mut terminal, tree, read_only);
+    let result = browse_with(&mut terminal, tree, read_only, None);
+    ratatui::restore();
+    result
+}
+
+/// Browse a tree that lives on another machine, staging and committing through the connection
+/// that produced it.
+pub fn browse_remote(tree: Tree, remote: ccdu_remote::Remote) -> io::Result<()> {
+    let mut terminal = ratatui::init();
+    let result = browse_with(
+        &mut terminal,
+        tree,
+        None,
+        Some(std::sync::Arc::new(std::sync::Mutex::new(remote))),
+    );
     ratatui::restore();
     result
 }
 
 fn browse(terminal: &mut DefaultTerminal, tree: Tree) -> io::Result<()> {
-    browse_with(terminal, tree, None)
+    browse_with(terminal, tree, None, None)
 }
 
 fn browse_with(
     terminal: &mut DefaultTerminal,
     tree: Tree,
     read_only: Option<String>,
+    remote: Option<std::sync::Arc<std::sync::Mutex<ccdu_remote::Remote>>>,
 ) -> io::Result<()> {
     let mut app = App::new(tree);
     app.read_only = read_only;
+    app.remote = remote;
     let mut list_state = ListState::default();
 
     while !app.quit {

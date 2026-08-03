@@ -527,6 +527,23 @@ fn plan_command(cmd: PlanCmd) -> Result<()> {
     }
 }
 
+/// Open a connection and scan through it, keeping the connection for staging and committing.
+fn connect_remote(
+    target: &Target,
+    args: &ScanArgs,
+) -> Result<(ccdu_core::model::Tree, Remote), std::io::Error> {
+    let mut remote = Remote::connect(target.agent_command(&args.remote_ccdu))?;
+    eprintln!("scanning {} on {} (ccdu {})", target.path, remote.host, remote.version);
+    let tree = remote.scan(
+        &target.path,
+        args.one_file_system,
+        args.threads.unwrap_or(8),
+        args.excludes.clone(),
+        None,
+    )?;
+    Ok((tree, remote))
+}
+
 /// Fetch a tree from another machine, preferring its ccdu and falling back to its ncdu.
 fn scan_remote(target: &Target, args: &ScanArgs) -> Result<ccdu_core::model::Tree> {
     let threads = args.threads.unwrap_or(8);
@@ -566,12 +583,23 @@ fn browse(args: ScanArgs) -> Result<()> {
         return ccdu_tui::browse_tree(tree, Some(why)).context("terminal interface");
     }
     if let Some(target) = remote_target(&args) {
-        let tree = scan_remote(&target, &args)?;
-        let why = format!(
-            "these files are on {}; run `ccdu {}` there to change them",
-            target.host, target.path
-        );
-        return ccdu_tui::browse_tree(tree, Some(why)).context("terminal interface");
+        // With an agent the connection stays open, so staging and committing happen where the
+        // files are. The ncdu fallback has no agent to talk to, so that tree is read-only.
+        return match connect_remote(&target, &args) {
+            Ok((tree, remote)) => {
+                ccdu_tui::browse_remote(tree, remote).context("terminal interface")
+            }
+            Err(_) => {
+                let tree = scan_with_ncdu(&target).with_context(|| {
+                    format!("scanning {} on {} with ncdu", target.path, target.host)
+                })?;
+                let why = format!(
+                    "fetched from {} with ncdu, which cannot make changes; run `ccdu {}` there",
+                    target.host, target.path
+                );
+                ccdu_tui::browse_tree(tree, Some(why)).context("terminal interface")
+            }
+        };
     }
     let (path, opts) = prepare(&args)?;
     ccdu_tui::run(path, opts).context("terminal interface")

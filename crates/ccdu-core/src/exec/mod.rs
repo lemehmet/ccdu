@@ -101,8 +101,9 @@ impl ExecOptions<'_> {
     }
 }
 
-/// Progress, for a frontend that wants to show it.
-#[derive(Clone, Debug)]
+/// Progress, for a frontend that wants to show it. Serialisable so a remote agent can forward it
+/// to a caller watching from another machine.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExecEvent {
     Started {
         index: usize,
@@ -122,7 +123,7 @@ pub enum ExecEvent {
     },
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Outcome {
     pub done: usize,
     pub failed: usize,
@@ -139,7 +140,7 @@ impl Outcome {
 }
 
 /// What a plan directory's journal says about the last run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunState {
     NotStarted,
     /// Started and neither finished nor paused: a crash, or a kill.

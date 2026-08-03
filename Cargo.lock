@@ -247,6 +247,7 @@ name = "ccdu-tui"
 version = "0.1.0"
 dependencies = [
  "ccdu-core",
+ "ccdu-remote",
  "crossbeam-channel",
  "ratatui",
  "tempfile",

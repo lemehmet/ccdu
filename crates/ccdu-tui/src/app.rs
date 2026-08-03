@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ccdu_core::dup::{self, DupGroup, DupOptions, DupProgress};
 use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, Outcome};
@@ -16,6 +16,7 @@ use ccdu_core::format::human_size;
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
 use ccdu_core::plan::store::Store;
 use ccdu_core::plan::{validate, Conflict, Finding, Ident, Op, Plan, Severity, ValidateOptions};
+use ccdu_remote::Remote;
 use crossbeam_channel::Receiver;
 
 /// Which column the listing is ordered by.
@@ -82,6 +83,8 @@ pub struct Running {
     /// Set once the run ends, whether it finished, paused or failed.
     pub summary: Option<String>,
     pub plan_id: String,
+    /// Running on another machine, where our pause switch does not reach.
+    pub remote: bool,
 }
 
 impl Running {
@@ -231,6 +234,10 @@ pub struct App {
     /// Why this tree cannot be changed from here, if it cannot. Set for trees that were loaded or
     /// fetched rather than scanned: their paths describe another machine or another moment.
     pub read_only: Option<String>,
+    /// The machine holding these files, when it is not this one. Staging asks it what entries look
+    /// like, and committing runs there — the plan and its journal live where the files do, so an
+    /// interrupted commit is resumable on the machine that was doing the work.
+    pub remote: Option<Arc<Mutex<Remote>>>,
 
     remembered: HashMap<NodeId, usize>,
 }
@@ -290,6 +297,7 @@ impl App {
             show_treemap: false,
             dupes: None,
             read_only: None,
+            remote: None,
             remembered: HashMap::new(),
         };
         app.rebuild_rows();
@@ -588,21 +596,16 @@ impl App {
     }
 
     fn stage_all(&mut self, targets: &[NodeId]) {
-        let mut staged = 0;
-        for &id in targets {
-            match self.record(id, StagedKind::Delete) {
-                Ok(()) => staged += 1,
-                Err(message) => {
-                    self.status = Some(message);
-                    return;
-                }
+        match self.record_all(targets, |_| StagedKind::Delete) {
+            Ok(staged) => {
+                self.marks.clear();
+                self.status = Some(format!(
+                    "staged {staged} for deletion ({} total)",
+                    human_size(self.staged_bytes())
+                ));
             }
+            Err(message) => self.status = Some(message),
         }
-        self.marks.clear();
-        self.status = Some(format!(
-            "staged {staged} for deletion ({} total)",
-            human_size(self.staged_bytes())
-        ));
     }
 
     fn enter(&mut self) {
@@ -648,21 +651,7 @@ impl App {
 
     fn stage_delete(&mut self) {
         let targets = self.targets();
-        let mut staged = 0;
-        for id in targets {
-            match self.record(id, StagedKind::Delete) {
-                Ok(()) => staged += 1,
-                Err(message) => {
-                    self.status = Some(message);
-                    return;
-                }
-            }
-        }
-        self.marks.clear();
-        self.status = Some(format!(
-            "staged {staged} for deletion ({} total)",
-            ccdu_core::format::human_size(self.staged_bytes())
-        ));
+        self.stage_all(&targets);
     }
 
     fn ask_move_destination(&mut self) {
@@ -678,18 +667,47 @@ impl App {
         self.prompt = Some(Prompt { label, input: String::new(), targets });
     }
 
-    /// Read the entry's current identity and stage it. This is the only filesystem access
-    /// staging performs, and it is what the executor will later re-check.
-    fn record(&mut self, id: NodeId, kind: StagedKind) -> Result<(), String> {
+    /// Stage a set of entries, reading what each one currently looks like.
+    ///
+    /// Identities are fetched in one go rather than one at a time: over a connection that is a
+    /// single round trip instead of one per file, and locally it costs nothing either way.
+    fn record_all(
+        &mut self,
+        targets: &[NodeId],
+        kind: impl Fn(NodeId) -> StagedKind,
+    ) -> Result<usize, String> {
         if let Some(reason) = &self.read_only {
             return Err(reason.clone());
         }
-        let path = self.tree.path_of(id);
-        let ident =
-            Ident::of(&path).map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
-        let est_bytes = self.tree.node(id).disk;
-        self.staged.insert(id, Staged { kind, ident, est_bytes });
-        Ok(())
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let paths: Vec<PathBuf> = targets.iter().map(|&id| self.tree.path_of(id)).collect();
+        let idents = self.identities(&paths)?;
+
+        let mut staged = 0;
+        for ((&id, path), ident) in targets.iter().zip(&paths).zip(idents) {
+            let Some(ident) = ident else {
+                return Err(format!("cannot stage {}: it is no longer there", path.display()));
+            };
+            let est_bytes = self.tree.node(id).disk;
+            self.staged.insert(id, Staged { kind: kind(id), ident, est_bytes });
+            staged += 1;
+        }
+        Ok(staged)
+    }
+
+    /// What these paths look like now, asked of whichever machine holds them.
+    fn identities(&self, paths: &[PathBuf]) -> Result<Vec<Option<Ident>>, String> {
+        let Some(remote) = &self.remote else {
+            return Ok(paths.iter().map(|p| Ident::of(p).ok()).collect());
+        };
+        let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        let mut remote =
+            remote.lock().map_err(|_| "the connection is in a bad state".to_string())?;
+        let host = remote.host.clone();
+        remote.identify(&names).map_err(|e| format!("asking {host}: {e}"))
     }
 
     fn unstage(&mut self) {
@@ -732,21 +750,18 @@ impl App {
             return;
         }
 
-        let mut staged = 0;
-        for id in prompt.targets {
-            // Each entry keeps its own name under the destination directory, the way `mv` into a
-            // directory behaves.
-            let dst = dir.join(self.tree.name(id));
-            match self.record(id, StagedKind::Move(dst)) {
-                Ok(()) => staged += 1,
-                Err(message) => {
-                    self.status = Some(message);
-                    return;
-                }
+        // Each entry keeps its own name under the destination directory, the way `mv` into a
+        // directory behaves.
+        let names: HashMap<NodeId, PathBuf> =
+            prompt.targets.iter().map(|&id| (id, dir.join(self.tree.name(id)))).collect();
+
+        match self.record_all(&prompt.targets, |id| StagedKind::Move(names[&id].clone())) {
+            Ok(staged) => {
+                self.marks.clear();
+                self.status = Some(format!("staged {staged} to move into {}", dir.display()));
             }
+            Err(message) => self.status = Some(message),
         }
-        self.marks.clear();
-        self.status = Some(format!("staged {staged} to move into {}", dir.display()));
     }
 
     /// Build the plan from what is staged and validate it.
@@ -854,34 +869,64 @@ impl App {
     fn start_commit(&mut self) {
         let mut plan = self.plan.clone();
         plan.normalize();
-
-        let dir = match self.store.save(&plan) {
-            Ok(path) => path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-            Err(e) => {
-                self.status = Some(format!("could not save the plan: {e}"));
-                self.view = View::Plan;
-                return;
-            }
-        };
+        let total = plan.ops.len();
+        let plan_id = plan.id.clone();
 
         let control = Arc::new(Control::new());
         let (event_tx, events) = crossbeam_channel::unbounded();
         let (result_tx, result) = crossbeam_channel::bounded(1);
 
-        let total = plan.ops.len();
-        let plan_id = plan.id.clone();
-        let worker_control = Arc::clone(&control);
-        std::thread::spawn(move || {
-            let outcome = exec::execute(
-                &plan,
-                &dir,
-                &ExecOptions::default(),
-                &worker_control,
-                Some(&event_tx),
-            );
-            drop(event_tx);
-            result_tx.send(outcome).ok();
-        });
+        // Where the files are is where the plan, the journal and the work all belong. Running a
+        // commit from here against another machine would leave the record of a half-finished run
+        // on the wrong side of the connection.
+        if let Some(remote) = self.remote.clone() {
+            let saved = remote
+                .lock()
+                .map_err(|_| "the connection is in a bad state".to_string())
+                .and_then(|mut r| r.save_plan(&plan).map_err(|e| e.to_string()));
+            let id = match saved {
+                Ok((id, _)) => id,
+                Err(message) => {
+                    self.status = Some(format!("could not store the plan: {message}"));
+                    self.view = View::Plan;
+                    return;
+                }
+            };
+            std::thread::spawn(move || {
+                let outcome = remote
+                    .lock()
+                    .map_err(|_| io::Error::other("the connection is in a bad state"))
+                    .and_then(|mut r| {
+                        r.apply(&id, false, |event| {
+                            event_tx.send(event).ok();
+                        })
+                        .map(|(outcome, _)| outcome)
+                    });
+                drop(event_tx);
+                result_tx.send(outcome).ok();
+            });
+        } else {
+            let dir = match self.store.save(&plan) {
+                Ok(path) => path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+                Err(e) => {
+                    self.status = Some(format!("could not save the plan: {e}"));
+                    self.view = View::Plan;
+                    return;
+                }
+            };
+            let worker_control = Arc::clone(&control);
+            std::thread::spawn(move || {
+                let outcome = exec::execute(
+                    &plan,
+                    &dir,
+                    &ExecOptions::default(),
+                    &worker_control,
+                    Some(&event_tx),
+                );
+                drop(event_tx);
+                result_tx.send(outcome).ok();
+            });
+        }
 
         self.run = Some(Running {
             control,
@@ -892,6 +937,7 @@ impl App {
             completed: 0,
             summary: None,
             plan_id,
+            remote: self.remote.is_some(),
         });
         self.view = View::Running;
         self.status = None;
@@ -903,7 +949,15 @@ impl App {
             return;
         };
         match action {
-            // Pausing mid-commit is the same mechanism recovery uses, so it is always safe.
+            // Pausing mid-commit is the same mechanism recovery uses, so it is always safe —
+            // locally. A commit running on another machine has its own switch, and reaching it
+            // would mean interrupting the stream we are reading; say so rather than do nothing.
+            Action::TogglePlan | Action::Input('p') if !run.is_finished() && run.remote => {
+                self.status = Some(format!(
+                    "this commit is running elsewhere; stop it there, then `ccdu resume {}`",
+                    run.plan_id
+                ));
+            }
             Action::TogglePlan | Action::Input('p') if !run.is_finished() => run.pause(),
             Action::Dismiss | Action::Quit | Action::Leave if run.is_finished() => {
                 self.view = View::Browse;
@@ -948,6 +1002,9 @@ impl App {
                     human_size(o.freed),
                     run.plan_id
                 ),
+                Err(e) if run.remote => {
+                    format!("{e}; the run is recoverable there with `ccdu resume {}`", run.plan_id)
+                }
                 Ok(o) if o.failed > 0 => format!(
                     "{} done, {} failed, {} reclaimed",
                     o.done,

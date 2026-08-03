@@ -8,8 +8,10 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions};
 use ccdu_core::export;
 use ccdu_core::plan::store::Store;
+use ccdu_core::plan::Ident;
 use ccdu_core::scan::{scan, Progress, ScanOptions};
 
 use crate::protocol::{
@@ -87,6 +89,14 @@ pub fn serve(input: impl Read, mut out: impl Write) -> io::Result<()> {
                 write_message(&mut out, &response)?;
             }
 
+            Request::Identify { paths } => {
+                let idents =
+                    paths.iter().map(|p| Ident::of(std::path::Path::new(p)).ok()).collect();
+                write_message(&mut out, &Response::Identities { idents })?;
+            }
+
+            Request::Apply { id, dry_run } => serve_apply(&mut out, &id, dry_run)?,
+
             Request::Bye => return Ok(()),
         }
     }
@@ -154,6 +164,57 @@ fn serve_scan(
             let mut blob = Vec::new();
             export::write(&tree, &mut blob, export::Format::Native)?;
             write_frame(out, TAG_TREE, &blob)
+        }
+        Err(e) => write_message(out, &Response::Error { message: e.to_string() }),
+    }
+}
+
+/// Run a stored plan, forwarding progress as it happens.
+///
+/// The plan is loaded from this host's own store, so the caller names a plan rather than shipping
+/// one: what runs is what was reviewed and saved here, not whatever arrived down the pipe.
+fn serve_apply(out: &mut impl Write, id: &str, dry_run: bool) -> io::Result<()> {
+    let store = Store::open_default();
+    let plan = match store.load(id) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return write_message(out, &Response::Error { message: format!("plan {id}: {e}") })
+        }
+    };
+    let dir = match store.dir_for(id) {
+        Ok(dir) => dir,
+        Err(e) => return write_message(out, &Response::Error { message: e.to_string() }),
+    };
+
+    let (tx, rx) = crossbeam_channel::unbounded::<ExecEvent>();
+    let control = Control::new();
+
+    let outcome = std::thread::scope(|scope| {
+        let control = &control;
+        let plan = &plan;
+        let dir = &dir;
+        let exec_tx = tx.clone();
+        let handle = scope.spawn(move || {
+            let opts = ExecOptions { dry_run, ..Default::default() };
+            exec::execute(plan, dir, &opts, control, Some(&exec_tx))
+        });
+        // Same reasoning as the scan: the last sender must live in the worker, or this loop waits
+        // for one that never goes away.
+        drop(tx);
+
+        for event in &rx {
+            if write_message(out, &Response::Exec { event }).is_err() {
+                control.pause();
+                break;
+            }
+        }
+        handle.join().unwrap_or_else(|_| Err(io::Error::other("executor panicked")))
+    });
+
+    match outcome {
+        Ok(outcome) => {
+            let state = exec::state(&dir).unwrap_or(exec::RunState::Interrupted);
+            write_message(out, &Response::ExecDone { outcome, state })
         }
         Err(e) => write_message(out, &Response::Error { message: e.to_string() }),
     }
@@ -268,6 +329,92 @@ mod tests {
             "{replies:?}"
         );
         assert!(!frames.iter().any(|(tag, _)| *tag == TAG_TREE));
+    }
+
+    #[test]
+    fn identities_come_back_in_the_order_they_were_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("here"), vec![0u8; 100]).unwrap();
+
+        let frames = exchange(&[
+            Request::Hello { version: VERSION },
+            Request::Identify {
+                paths: vec![
+                    dir.path().join("here").display().to_string(),
+                    "/definitely/not/here".to_string(),
+                ],
+            },
+            Request::Bye,
+        ]);
+
+        let replies = messages(&frames);
+        let Response::Identities { idents } = &replies[1] else { panic!("{replies:?}") };
+        assert_eq!(idents.len(), 2, "one answer per question, in order");
+        assert_eq!(idents[0].as_ref().unwrap().size, 100);
+        assert!(idents[1].is_none(), "a path that is not there has no identity");
+    }
+
+    #[test]
+    fn a_plan_is_run_from_the_agents_own_store() {
+        use ccdu_core::plan::{Op, Plan};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let target = dir.path().join("doomed");
+        std::fs::write(&target, vec![0u8; 20_000]).unwrap();
+
+        let mut plan = Plan::new(dir.path().to_path_buf());
+        plan.ops.push(Op::Delete {
+            ident: Ident::of(&target).unwrap(),
+            path: target.clone(),
+            est_bytes: 20_000,
+        });
+        Store::at(state.path().join("plans")).save(&plan).unwrap();
+
+        // The agent reads CCDU_STATE_DIR the same way the rest of the program does.
+        let previous = std::env::var_os("CCDU_STATE_DIR");
+        unsafe { std::env::set_var("CCDU_STATE_DIR", state.path()) };
+
+        let frames = exchange(&[
+            Request::Hello { version: VERSION },
+            Request::Apply { id: plan.id.clone(), dry_run: false },
+            Request::Bye,
+        ]);
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CCDU_STATE_DIR", value) },
+            None => unsafe { std::env::remove_var("CCDU_STATE_DIR") },
+        }
+
+        let replies = messages(&frames);
+        assert!(
+            replies.iter().any(|r| matches!(r, Response::Exec { .. })),
+            "no progress was streamed: {replies:?}"
+        );
+        let done = replies.iter().find_map(|r| match r {
+            Response::ExecDone { outcome, state } => Some((outcome.clone(), *state)),
+            _ => None,
+        });
+        let (outcome, state) = done.expect("no completion reported");
+        assert_eq!(outcome.done, 1, "{outcome:?}");
+        assert_eq!(state, exec::RunState::Finished);
+        assert!(!target.exists(), "the plan ran but the file is still there");
+    }
+
+    #[test]
+    fn applying_a_plan_that_is_not_there_is_an_error() {
+        let frames = exchange(&[
+            Request::Hello { version: VERSION },
+            Request::Apply { id: "20260101T000000-nosuchid".into(), dry_run: false },
+            Request::Bye,
+        ]);
+        let replies = messages(&frames);
+        assert!(
+            replies
+                .iter()
+                .any(|r| matches!(r, Response::Error { message } if message.contains("plan"))),
+            "{replies:?}"
+        );
     }
 
     #[test]

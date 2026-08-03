@@ -147,3 +147,91 @@ fn the_agent_writes_nothing_to_stdout_but_frames() {
     // Reaching here at all means every byte parsed as a frame; a stray write would have
     // desynchronised the stream and failed above.
 }
+
+#[test]
+fn a_remote_tree_can_be_staged_against_and_committed() {
+    use ccdu_core::plan::{Op, Plan};
+
+    let dir = tree_fixture();
+    let state = tempfile::tempdir().unwrap();
+
+    let mut command = agent();
+    command.env("CCDU_STATE_DIR", state.path());
+    let mut remote = Remote::connect(command).unwrap();
+
+    // The whole loop as a caller would drive it: scan, ask what things are, build a plan from
+    // those identities, store it over there, then run it over there.
+    let tree = remote.scan(&dir.path().display().to_string(), false, 2, Vec::new(), None).unwrap();
+    assert_eq!(tree.node(ROOT).items, 6);
+
+    let target = dir.path().join("logs");
+    let idents = remote.identify(&[target.display().to_string()]).unwrap();
+    let ident = idents[0].clone().expect("no identity for a path that exists");
+
+    let mut plan = Plan::new(dir.path().to_path_buf());
+    plan.ops.push(Op::Delete { path: target.clone(), ident, est_bytes: 50_000 });
+    let (id, _) = remote.save_plan(&plan).unwrap();
+
+    let mut events = Vec::new();
+    let (outcome, state) = remote.apply(&id, false, |e| events.push(e)).unwrap();
+
+    assert_eq!(outcome.done, 1, "{outcome:?}");
+    assert_eq!(outcome.failed, 0);
+    assert!(outcome.freed >= 50_000);
+    assert_eq!(state, ccdu_core::exec::RunState::Finished);
+    assert!(!events.is_empty(), "progress should stream while the commit runs");
+    assert!(!target.exists(), "the commit reported success but the directory is still there");
+    assert!(dir.path().join("readme.txt").exists(), "something unstaged was removed");
+}
+
+#[test]
+fn a_remote_dry_run_reports_without_changing_anything() {
+    use ccdu_core::plan::{Op, Plan};
+
+    let dir = tree_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut command = agent();
+    command.env("CCDU_STATE_DIR", state.path());
+    let mut remote = Remote::connect(command).unwrap();
+
+    let target = dir.path().join("logs");
+    let ident = remote.identify(&[target.display().to_string()]).unwrap()[0].clone().unwrap();
+    let mut plan = Plan::new(dir.path().to_path_buf());
+    plan.ops.push(Op::Delete { path: target.clone(), ident, est_bytes: 1234 });
+    let (id, _) = remote.save_plan(&plan).unwrap();
+
+    let (outcome, _) = remote.apply(&id, true, |_| {}).unwrap();
+    assert_eq!(outcome.done, 1);
+    assert_eq!(outcome.freed, 1234, "a dry run reports the estimate");
+    assert!(target.exists(), "a dry run removed something");
+
+    // And it is still runnable afterwards.
+    let (outcome, _) = remote.apply(&id, false, |_| {}).unwrap();
+    assert_eq!(outcome.done, 1);
+    assert!(!target.exists());
+}
+
+#[test]
+fn a_stale_identity_stops_a_remote_commit() {
+    use ccdu_core::plan::{Op, Plan};
+
+    let dir = tree_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut command = agent();
+    command.env("CCDU_STATE_DIR", state.path());
+    let mut remote = Remote::connect(command).unwrap();
+
+    let target = dir.path().join("readme.txt");
+    let ident = remote.identify(&[target.display().to_string()]).unwrap()[0].clone().unwrap();
+    let mut plan = Plan::new(dir.path().to_path_buf());
+    plan.ops.push(Op::Delete { path: target.clone(), ident, est_bytes: 500 });
+    let (id, _) = remote.save_plan(&plan).unwrap();
+
+    // Same path, different file, after the plan was made.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::write(&target, vec![9u8; 4321]).unwrap();
+
+    let (outcome, _) = remote.apply(&id, false, |_| {}).unwrap();
+    assert_eq!(outcome.failed, 1, "a changed file was removed anyway: {outcome:?}");
+    assert!(target.exists(), "a file we never reviewed was deleted over the wire");
+}

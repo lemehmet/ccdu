@@ -6,9 +6,10 @@
 use std::io::{self, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use ccdu_core::exec::{ExecEvent, Outcome, RunState};
 use ccdu_core::export;
 use ccdu_core::model::Tree;
-use ccdu_core::plan::Plan;
+use ccdu_core::plan::{Ident, Plan};
 use ccdu_core::scan::Progress;
 use crossbeam_channel::Sender;
 
@@ -177,6 +178,49 @@ impl Remote {
             Some(Response::PlanSaved { id, path }) => Ok((id, path)),
             Some(Response::Error { message }) => Err(io::Error::other(message)),
             other => Err(io::Error::other(format!("unexpected reply: {other:?}"))),
+        }
+    }
+
+    /// Ask the far side what these paths look like right now.
+    ///
+    /// Staging records an entry's identity, and only the machine holding the file can supply it.
+    /// One answer per path, in order, `None` where it could not be read.
+    pub fn identify(&mut self, paths: &[String]) -> io::Result<Vec<Option<Ident>>> {
+        write_message(&mut self.output, &Request::Identify { paths: paths.to_vec() })?;
+        match self.next_message()? {
+            Some(Response::Identities { idents }) if idents.len() == paths.len() => Ok(idents),
+            Some(Response::Identities { idents }) => Err(io::Error::other(format!(
+                "asked about {} paths, heard about {}",
+                paths.len(),
+                idents.len()
+            ))),
+            Some(Response::Error { message }) => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("unexpected reply: {other:?}"))),
+        }
+    }
+
+    /// Run a plan already stored on the far side, reporting progress as it arrives.
+    pub fn apply(
+        &mut self,
+        id: &str,
+        dry_run: bool,
+        mut on_event: impl FnMut(ExecEvent),
+    ) -> io::Result<(Outcome, RunState)> {
+        write_message(&mut self.output, &Request::Apply { id: id.to_string(), dry_run })?;
+        loop {
+            match self.next_message()? {
+                Some(Response::Exec { event }) => on_event(event),
+                Some(Response::ExecDone { outcome, state }) => return Ok((outcome, state)),
+                Some(Response::Error { message }) => return Err(io::Error::other(message)),
+                // Losing the connection mid-commit is exactly what the journal is for: the run is
+                // recoverable on the far side with `ccdu resume`.
+                None => {
+                    return Err(io::Error::other(
+                        "the remote closed the connection mid-commit; resume it there",
+                    ))
+                }
+                other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
+            }
         }
     }
 
