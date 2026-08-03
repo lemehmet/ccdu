@@ -41,6 +41,13 @@ pub fn format_time(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
 }
 
+/// Same, to the second. Used where two timestamps are compared and minute resolution would print
+/// them as identical.
+pub fn format_time_secs(secs: i64) -> String {
+    let rem = secs.rem_euclid(86_400);
+    format!("{}:{:02}", format_time(secs), rem % 60)
+}
+
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -84,5 +91,14 @@ mod tests {
         assert_eq!(format_time(951_782_400), "2000-02-29 00:00");
         // Before the epoch, where naive division goes wrong.
         assert_eq!(format_time(-1), "1969-12-31 23:59");
+    }
+
+    #[test]
+    fn second_resolution_distinguishes_times_within_a_minute() {
+        assert_eq!(format_time_secs(0), "1970-01-01 00:00:00");
+        assert_eq!(format_time_secs(1_000_000_000), "2001-09-09 01:46:40");
+        // The case this exists for: same minute, different instant.
+        assert_ne!(format_time_secs(1_000_000_000), format_time_secs(1_000_000_010));
+        assert_eq!(format_time(1_000_000_000), format_time(1_000_000_010));
     }
 }

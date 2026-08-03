@@ -86,7 +86,9 @@ fn browse(terminal: &mut DefaultTerminal, tree: Tree) -> io::Result<()> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if let Some(action) = translate(&key) {
+            if let Some(action) = translate(&key, app.prompt.is_some()) {
+                // A status line answers the last action, so it should not outlive it.
+                app.status = None;
                 app.apply(action);
             }
         }
@@ -99,10 +101,22 @@ fn is_quit(key: &KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-/// Map a key press onto a browser action. Keys follow ncdu wherever it has one.
-fn translate(key: &KeyEvent) -> Option<Action> {
+/// Map a key press onto an action. Keys follow ncdu wherever it has one.
+///
+/// While a prompt is open almost every key is text, so only the few that steer the prompt are
+/// interpreted — otherwise typing a path named `dst` would stage three deletions.
+fn translate(key: &KeyEvent, prompting: bool) -> Option<Action> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(Action::Quit);
+    }
+    if prompting {
+        return Some(match key.code {
+            KeyCode::Char(c) => Action::Input(c),
+            KeyCode::Backspace => Action::Backspace,
+            KeyCode::Enter => Action::Submit,
+            KeyCode::Esc => Action::Dismiss,
+            _ => return None,
+        });
     }
     Some(match key.code {
         KeyCode::Char('j') | KeyCode::Down => Action::Down,
@@ -121,6 +135,12 @@ fn translate(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('g') => Action::CycleGraph,
         KeyCode::Char('i') => Action::ToggleInfo,
         KeyCode::Char('?') => Action::ToggleHelp,
+        KeyCode::Char(' ') => Action::Mark,
+        KeyCode::Char('d') => Action::StageDelete,
+        KeyCode::Char('m') => Action::StageMove,
+        KeyCode::Char('u') => Action::Unstage,
+        KeyCode::Char('p') => Action::TogglePlan,
+        KeyCode::Char('w') => Action::SavePlan,
         KeyCode::Esc => Action::Dismiss,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
@@ -213,14 +233,39 @@ mod tests {
     #[test]
     fn keys_map_to_the_expected_actions() {
         let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        assert_eq!(translate(&key('j')), Some(Action::Down));
-        assert_eq!(translate(&key('s')), Some(Action::Sort(Sort::Size)));
-        assert_eq!(translate(&key('M')), Some(Action::Sort(Sort::Mtime)));
-        assert_eq!(translate(&key('q')), Some(Action::Quit));
+        assert_eq!(translate(&key('j'), false), Some(Action::Down));
+        assert_eq!(translate(&key('s'), false), Some(Action::Sort(Sort::Size)));
+        assert_eq!(translate(&key('M'), false), Some(Action::Sort(Sort::Mtime)));
+        assert_eq!(translate(&key('m'), false), Some(Action::StageMove));
+        assert_eq!(translate(&key('d'), false), Some(Action::StageDelete));
+        assert_eq!(translate(&key(' '), false), Some(Action::Mark));
+        assert_eq!(translate(&key('q'), false), Some(Action::Quit));
         assert_eq!(
-            translate(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            translate(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
             Some(Action::Quit)
         );
-        assert_eq!(translate(&key('z')), None);
+        assert_eq!(translate(&key('z'), false), None);
+    }
+
+    #[test]
+    fn a_prompt_turns_command_keys_back_into_text() {
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        // Without this, typing a destination like "/mnt/dump" would fire d, u, m and p.
+        for c in ['d', 'u', 'm', 'p', 'q', 'w'] {
+            assert_eq!(translate(&key(c), true), Some(Action::Input(c)), "{c} leaked");
+        }
+        assert_eq!(
+            translate(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            translate(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+            Some(Action::Dismiss)
+        );
+        // Ctrl-C still gets you out of anything.
+        assert_eq!(
+            translate(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), true),
+            Some(Action::Quit)
+        );
     }
 }

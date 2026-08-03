@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ccdu_core::format::human_size;
+use ccdu_core::format::{format_time, human_size};
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
+use ccdu_core::plan::store::Store;
+use ccdu_core::plan::{validate, Severity, ValidateOptions};
 use ccdu_core::scan::{scan, Progress, ScanOptions};
 use clap::{Args, Parser, Subcommand};
 
@@ -29,6 +31,31 @@ struct Cli {
 enum Command {
     /// Scan a directory and print a usage summary instead of opening the browser.
     Scan(ScanArgs),
+
+    /// Inspect saved plans.
+    Plan {
+        #[command(subcommand)]
+        cmd: PlanCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// List saved plans, newest first.
+    #[command(alias = "ls")]
+    List,
+    /// Print a plan's operations.
+    Show { id: String },
+    /// Re-check a plan against the current state of the filesystem.
+    Validate {
+        id: String,
+        /// Permit operations on paths outside the scanned tree.
+        #[arg(long)]
+        allow_outside: bool,
+    },
+    /// Delete a saved plan. Removes the plan, never the files it names.
+    #[command(alias = "remove")]
+    Rm { id: String },
 }
 
 #[derive(Args, Clone)]
@@ -61,7 +88,78 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Scan(args)) => report(args),
+        Some(Command::Plan { cmd }) => plan_command(cmd),
         None => browse(cli.scan),
+    }
+}
+
+fn plan_command(cmd: PlanCmd) -> Result<()> {
+    let store = Store::open_default();
+    match cmd {
+        PlanCmd::List => {
+            let plans = store.list()?;
+            if plans.is_empty() {
+                println!("no plans in {}", store.dir().display());
+                return Ok(());
+            }
+            for p in plans {
+                println!(
+                    "{}  {}  {:>4} ops  {:>10} to reclaim  {}",
+                    p.id,
+                    format_time(p.created),
+                    p.ops,
+                    human_size(p.delete_bytes),
+                    p.root.display()
+                );
+            }
+            Ok(())
+        }
+
+        PlanCmd::Show { id } => {
+            let plan = store.load(&id).with_context(|| format!("loading plan {id}"))?;
+            println!("id       {}", plan.id);
+            println!("created  {}", format_time(plan.created));
+            println!("host     {}", plan.host);
+            println!("root     {}", plan.root.display());
+            println!("reclaims {}", human_size(plan.delete_bytes()));
+            if plan.move_bytes() > 0 {
+                println!("moves    {}", human_size(plan.move_bytes()));
+            }
+            println!();
+            for (i, op) in plan.ops.iter().enumerate() {
+                println!("{i:>4}  {:>10}  {}", human_size(op.est_bytes()), op.summary());
+            }
+            Ok(())
+        }
+
+        PlanCmd::Validate { id, allow_outside } => {
+            let plan = store.load(&id).with_context(|| format!("loading plan {id}"))?;
+            let opts = ValidateOptions { allow_outside_root: allow_outside, ..Default::default() };
+            let findings = validate(&plan, &opts);
+
+            let errors = findings.iter().filter(|f| f.severity == Severity::Error).count();
+            for f in &findings {
+                let mark = if f.severity == Severity::Error { "error" } else { "warn " };
+                match f.op {
+                    Some(i) => println!("{mark}  #{i}  {}", f.message),
+                    None => println!("{mark}       {}", f.message),
+                }
+            }
+            if findings.is_empty() {
+                println!("ok: {} operations, nothing to report", plan.ops.len());
+            }
+            if errors > 0 {
+                // A non-zero status so this is usable from a script.
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+
+        PlanCmd::Rm { id } => {
+            store.remove(&id).with_context(|| format!("removing plan {id}"))?;
+            println!("removed plan {id}");
+            Ok(())
+        }
     }
 }
 

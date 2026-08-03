@@ -6,4 +6,5 @@
 
 pub mod format;
 pub mod model;
+pub mod plan;
 pub mod scan;
