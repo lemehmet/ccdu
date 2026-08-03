@@ -17,7 +17,7 @@ Early development. See the milestone table below.
 | M3 | Staging, plan persistence, validation | done |
 | M4 | Executor: deletes, journal, pause/resume | done |
 | M5 | Moves: same-fs, reflink, cross-device | done |
-| M6 | Treemap panel, duplicate detection | |
+| M6 | Treemap panel, duplicate detection | done |
 | M7 | ncdu import/export, SSH agent | |
 
 ## Try it
@@ -40,10 +40,37 @@ found so far, marked `[partial scan]` so the totals are not mistaken for the who
 | `s` `n` `C` `M` | sort by size, name, item count, mtime (again to reverse) |
 | `a` | apparent size vs disk usage |
 | `g` | cycle graph: bar, percent, both, off |
+| `t` / `D` | treemap panel / find duplicate files |
 | `Space` | mark an entry; `d`/`m`/`u` then apply to every mark |
 | `d` / `m` / `u` | stage a deletion / a move / unstage |
 | `p` / `w` / `c` | review the plan / write it to the plan store / commit |
 | `i` / `?` / `q` | details / keys / quit |
+
+## Duplicates and the treemap
+
+`t` puts a squarified treemap beside the listing — areas proportional to size, so the thing worth
+deleting is the thing that looks biggest.
+
+`D` finds files with identical contents, in three stages, each shrinking the input to the next:
+group by size (free — the scan already knows every size), hash the first and last few kilobytes
+(a fixed read however large the file), then hash in full whatever survived. Hardlinks are excluded:
+two names for one inode are not two copies.
+
+```
+ duplicates   2 groups  14.0 MiB reclaimable
+ 3 copies of 6.0 MiB  — 12.0 MiB reclaimable
+   keep work/video-again.mp4
+        media/video.mp4
+        backup/video-copy.mp4
+```
+
+`A` stages every copy in a group except the first. It never stages the whole group: a bulk action
+that could remove the last copy is not a labour saver. A copy that is itself hardlinked elsewhere
+says so and is left out of the reclaimable total, because removing that one name frees nothing.
+
+```sh
+ccdu dupes /some/path --min-size 1048576 --top 5
+```
 
 ## Staging
 

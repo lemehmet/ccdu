@@ -4,6 +4,7 @@
 //! reads the tree, so the same [`App`] drives both this and the snapshot tests.
 
 pub mod app;
+pub mod treemap;
 pub mod ui;
 
 use std::io;
@@ -77,8 +78,10 @@ fn browse(terminal: &mut DefaultTerminal, tree: Tree) -> io::Result<()> {
     let mut list_state = ListState::default();
 
     while !app.quit {
-        // A commit runs on its own thread; this is where its progress reaches the screen.
+        // Both the commit and the duplicate scan run on their own threads; this is where their
+        // progress reaches the screen.
         app.poll_run();
+        app.poll_dupes();
         terminal.draw(|frame| ui::draw(frame, &app, &mut list_state))?;
 
         if !event::poll(TICK)? {
@@ -145,6 +148,9 @@ fn translate(key: &KeyEvent, prompting: bool) -> Option<Action> {
         KeyCode::Char('w') => Action::SavePlan,
         KeyCode::Char('c') => Action::Commit,
         KeyCode::Char('y') => Action::Confirm,
+        KeyCode::Char('t') => Action::ToggleTreemap,
+        KeyCode::Char('D') => Action::ToggleDupes,
+        KeyCode::Char('A') => Action::StageGroupRest,
         KeyCode::Esc => Action::Dismiss,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
@@ -262,6 +268,62 @@ mod tests {
         let out = render(&app, 100, 6);
         let footer = out.lines().last().unwrap();
         assert!(footer.contains("before the commit"), "{footer}");
+    }
+
+    #[test]
+    fn the_treemap_panel_draws_beside_the_listing() {
+        let (_d, mut app) = fixture();
+        let without = render(&app, 90, 12);
+        assert!(!without.contains("treemap"));
+
+        app.apply(Action::ToggleTreemap);
+        let with = render(&app, 90, 12);
+
+        assert!(with.contains("treemap"), "{with}");
+        // The listing is still there beside it.
+        assert!(with.contains("logs/"), "{with}");
+        assert!(with.contains("notes.txt"), "{with}");
+        // And a label made it into a tile.
+        assert!(with.matches("logs").count() >= 2, "no tile label:\n{with}");
+    }
+
+    #[test]
+    fn the_treemap_survives_a_panel_too_small_to_draw_in() {
+        let (_d, mut app) = fixture();
+        app.apply(Action::ToggleTreemap);
+        // Must not panic when the split leaves almost nothing for the map.
+        render(&app, 24, 4);
+        render(&app, 18, 3);
+    }
+
+    #[test]
+    fn duplicate_rows_stay_distinguishable_in_a_narrow_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("deeply/nested/first")).unwrap();
+        fs::create_dir_all(root.join("deeply/nested/second")).unwrap();
+        for name in ["deeply/nested/first/payload.bin", "deeply/nested/second/payload.bin"] {
+            fs::write(root.join(name), vec![5u8; 30_000]).unwrap();
+        }
+        let tree = scan(root, &ScanOptions::default(), None, None).unwrap();
+        let mut app = App::new(tree);
+
+        app.apply(Action::ToggleDupes);
+        for _ in 0..2000 {
+            app.poll_dupes();
+            if app.dupes.as_ref().is_some_and(|d| !d.is_scanning()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // Copies of one file share everything but the tail. A row that shows only the shared part
+        // tells you nothing about which copy it is.
+        let out = render(&app, 80, 10);
+        assert!(out.contains("first/payload.bin"), "cannot tell the copies apart:\n{out}");
+        assert!(out.contains("second/payload.bin"), "cannot tell the copies apart:\n{out}");
+        assert!(out.contains("reclaimable"), "{out}");
+        assert!(!out.contains(&root.display().to_string()), "the shared root wastes the line");
     }
 
     #[test]

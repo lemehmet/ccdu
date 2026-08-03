@@ -10,7 +10,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Graph, StagedKind, View};
+use crate::app::{App, DupRow, Graph, StagedKind, View};
+use crate::treemap::{squarify, Tile};
+use ccdu_core::dup::{shares_inode, total_wasted};
+use ccdu_core::model::NodeId as Node;
 use ccdu_core::plan::Plan;
 
 const BAR_WIDTH: usize = 12;
@@ -52,7 +55,20 @@ pub fn draw(frame: &mut Frame, app: &App, list_state: &mut ListState) {
     match app.view {
         View::Browse => {
             draw_header(frame, app, header);
-            draw_listing(frame, app, body, list_state);
+            if app.show_treemap {
+                // The list keeps the majority: the map is for spotting, the list for acting.
+                let [list, map] =
+                    Layout::horizontal([Constraint::Percentage(60), Constraint::Min(16)])
+                        .areas(body);
+                draw_listing(frame, app, list, list_state);
+                draw_treemap(frame, app, map);
+            } else {
+                draw_listing(frame, app, body, list_state);
+            }
+        }
+        View::Dupes => {
+            draw_dupes_header(frame, app, header);
+            draw_dupes(frame, app, body, list_state);
         }
         View::Plan | View::Confirm => {
             draw_plan_header(frame, app, header);
@@ -477,6 +493,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             format!(" {} staged", app.staged.len()),
             "↑↓ move  u unstage  c commit  w write plan  p back  ? help  q back ",
         ),
+        View::Dupes => match app.dupes.as_ref() {
+            Some(d) if d.is_scanning() => (String::new(), "Esc to stop "),
+            _ => (
+                format!(" {} staged", app.staged.len()),
+                "space mark  d stage  A stage all but first  p plan  Esc back ",
+            ),
+        },
         View::Confirm => (" confirm".to_string(), "y commit  Esc go back "),
         View::Running => match app.run.as_ref() {
             Some(run) if run.is_finished() => (String::new(), "q back to the browser "),
@@ -577,7 +600,7 @@ fn field(label: &'static str, value: String) -> Line<'static> {
 }
 
 fn draw_help(frame: &mut Frame, view: View) {
-    const BROWSE: [(&str, &str); 16] = [
+    const BROWSE: [(&str, &str); 18] = [
         ("↑ ↓ j k", "move the cursor"),
         ("PgUp PgDn", "move a page"),
         ("Home End", "first / last entry"),
@@ -589,6 +612,8 @@ fn draw_help(frame: &mut Frame, view: View) {
         ("M", "sort by modification time"),
         ("a", "toggle apparent size vs disk usage"),
         ("g", "cycle graph: bar, percent, both, off"),
+        ("t", "show the treemap beside the listing"),
+        ("D", "find files with identical contents"),
         ("i", "show details for the selected entry"),
         ("Space", "mark an entry; actions apply to all marks"),
         ("d / m", "stage a deletion / a move"),
@@ -609,8 +634,18 @@ fn draw_help(frame: &mut Frame, view: View) {
         ("", "a paused or crashed run continues with `ccdu resume`"),
     ];
 
+    const DUPES: [(&str, &str); 6] = [
+        ("↑ ↓ j k", "move between copies; headers are skipped"),
+        ("Space", "mark a copy"),
+        ("d", "stage the marked copies for deletion"),
+        ("A", "stage every copy in this group except the first"),
+        ("p", "review the plan"),
+        ("Esc q", "back to the browser"),
+    ];
+
     let keys: &[(&str, &str)] = match view {
         View::Browse => &BROWSE,
+        View::Dupes => &DUPES,
         View::Plan | View::Confirm => &PLAN,
         View::Running => &RUNNING,
     };
@@ -649,4 +684,170 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 /// Validation settings the interface uses. Split out so the CLI and the TUI agree.
 pub fn validate_options() -> ValidateOptions {
     ValidateOptions::default()
+}
+
+/// Twelve hues that stay distinguishable side by side without a legend.
+const TILE_COLOURS: [Color; 6] =
+    [Color::Blue, Color::Magenta, Color::Cyan, Color::Green, Color::Yellow, Color::Red];
+
+/// Areas proportional to size, so the thing worth deleting is the thing that looks biggest.
+fn draw_treemap(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::new()
+        .borders(Borders::LEFT)
+        .title(" treemap ")
+        .border_style(Style::new().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+
+    let items: Vec<(Node, u64)> = app.rows.iter().map(|&id| (id, app.size_of(id))).collect();
+    let tiles = squarify(&items, inner.x, inner.y, inner.width, inner.height);
+    let selected = app.selected();
+
+    let buffer = frame.buffer_mut();
+    for (i, tile) in tiles.iter().enumerate() {
+        let is_selected = selected == Some(tile.id);
+        let colour = TILE_COLOURS[i % TILE_COLOURS.len()];
+        let style = if is_selected {
+            Style::new().bg(Color::White).fg(Color::Black).bold()
+        } else {
+            Style::new().bg(colour).fg(Color::Black)
+        };
+
+        for y in tile.y..tile.y + tile.height {
+            for x in tile.x..tile.x + tile.width {
+                buffer[(x, y)].set_char(' ').set_style(style);
+            }
+        }
+        write_label(buffer, app, tile, style);
+    }
+}
+
+/// Put the name inside the tile if there is room for any of it.
+fn write_label(buffer: &mut ratatui::buffer::Buffer, app: &App, tile: &Tile, style: Style) {
+    if tile.width < 3 {
+        return;
+    }
+    let mut name = app.tree.name(tile.id).to_string_lossy().into_owned();
+    if app.tree.node(tile.id).is_dir() {
+        name.push('/');
+    }
+    let room = tile.width as usize - 1;
+    if name.chars().count() > room {
+        name = name.chars().take(room.saturating_sub(1)).collect::<String>() + "…";
+    }
+
+    let y = tile.y + tile.height / 2;
+    for (i, ch) in name.chars().enumerate() {
+        let x = tile.x + 1 + i as u16;
+        if x >= tile.x + tile.width {
+            break;
+        }
+        buffer[(x, y)].set_char(ch).set_style(style);
+    }
+}
+
+fn draw_dupes_header(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(dupes) = app.dupes.as_ref() else { return };
+    let mut spans = vec![
+        Span::styled(" duplicates ", Style::new().bg(Color::Yellow).fg(Color::Black).bold()),
+        Span::raw("  "),
+    ];
+
+    if dupes.is_scanning() {
+        spans.push(Span::raw(format!(
+            "hashing {} of {} candidates, {} read",
+            human_count(dupes.latest.hashed as u64),
+            human_count(dupes.latest.candidates as u64),
+            human_size(dupes.latest.bytes_read)
+        )));
+    } else {
+        spans.push(Span::raw(format!("{} groups", dupes.groups.len())));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{} reclaimable", human_size(total_wasted(&dupes.groups))),
+            Style::new().fg(Color::Green),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_dupes(frame: &mut Frame, app: &App, area: Rect, list_state: &mut ListState) {
+    let Some(dupes) = app.dupes.as_ref() else { return };
+
+    if dupes.is_scanning() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  comparing files — sizes first, then the ends, then in full",
+                Style::new().fg(Color::DarkGray),
+            )),
+            area,
+        );
+        return;
+    }
+    if dupes.rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  no duplicate files found",
+                Style::new().fg(Color::DarkGray),
+            )),
+            area,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = dupes
+        .rows
+        .iter()
+        .map(|row| match row {
+            DupRow::Header(i) => {
+                let group = &dupes.groups[*i];
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {} copies of {}", group.nodes.len(), human_size(group.size)),
+                        Style::new().fg(Color::Yellow).bold(),
+                    ),
+                    Span::styled(
+                        format!("  — {} reclaimable", human_size(group.wasted)),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
+            DupRow::File(group, id) => {
+                let kept = dupes.groups[*group].nodes.first() == Some(id);
+                let mut spans = vec![stage_marker(app, *id)];
+                spans.push(Span::styled(
+                    if kept { " keep " } else { "      " },
+                    Style::new().fg(Color::Green),
+                ));
+                // Copies of one file share a long prefix and differ at the end, so the root is
+                // dropped and anything still too long is cut from the front. Truncating on the
+                // right would make every row in a group look identical.
+                let full = app.tree.path_of(*id);
+                let shown = full.strip_prefix(app.tree.root_path()).unwrap_or(&full);
+                spans.push(Span::raw(elide_left(
+                    &shown.display().to_string(),
+                    (area.width as usize).saturating_sub(52).max(16),
+                )));
+                // Removing one name of a hardlinked file frees nothing, so do not let the group's
+                // reclaimable total imply otherwise for this row.
+                if shares_inode(&app.tree, *id) {
+                    spans.push(Span::styled(
+                        "  (hardlinked; removing this frees nothing)",
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            }
+        })
+        .collect();
+
+    list_state.select(Some(dupes.cursor));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+        area,
+        list_state,
+    );
 }

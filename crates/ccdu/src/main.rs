@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use ccdu_core::dup::{find_duplicates, shares_inode, total_wasted, DupOptions};
 use ccdu_core::exec::journal::Event;
 use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, FaultFn, FaultPoint, Verify};
 use ccdu_core::format::{format_time, human_size};
@@ -64,6 +65,15 @@ enum Command {
 
     /// Report how far a plan's execution got.
     Status { id: String },
+
+    /// Report files with identical contents. `--top` limits how many groups are listed.
+    Dupes {
+        #[command(flatten)]
+        scan: ScanArgs,
+        /// Ignore files smaller than this many bytes.
+        #[arg(long, default_value_t = 4096, value_name = "BYTES")]
+        min_size: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -138,8 +148,55 @@ fn main() -> Result<()> {
         }
         Some(Command::Resume { id }) => apply(&id, false, true, false, Verify::Size, true),
         Some(Command::Status { id }) => status(&id),
+        Some(Command::Dupes { scan, min_size }) => dupes(scan, min_size),
         None => browse(cli.scan),
     }
+}
+
+/// Headless duplicate report.
+fn dupes(args: ScanArgs, min_size: u64) -> Result<()> {
+    let top = args.top;
+    let (path, scan_opts) = prepare(&args)?;
+    let tree = scan(&path, &scan_opts, None, None)
+        .with_context(|| format!("scanning {}", path.display()))?;
+
+    let opts = DupOptions { min_size, threads: scan_opts.threads };
+    let groups = find_duplicates(&tree, &opts, None, None);
+
+    if groups.is_empty() {
+        println!("no duplicate files under {}", path.display());
+        return Ok(());
+    }
+
+    println!(
+        "{} groups, {} reclaimable by keeping one copy of each\n",
+        groups.len(),
+        human_size(total_wasted(&groups))
+    );
+    for group in groups.iter().take(top) {
+        println!(
+            "{} copies of {} — {} reclaimable",
+            group.nodes.len(),
+            human_size(group.size),
+            human_size(group.wasted)
+        );
+        for (i, &id) in group.nodes.iter().enumerate() {
+            let note = if i == 0 { "  keep" } else { "      " };
+            // Removing one name of a hardlinked file frees nothing while its twins remain, so the
+            // line says so rather than let the group's total imply otherwise.
+            let hardlinked = if shares_inode(&tree, id) {
+                "  (hardlinked; removing this frees nothing)"
+            } else {
+                ""
+            };
+            println!("{note}  {}{hardlinked}", tree.path_of(id).display());
+        }
+        println!();
+    }
+    if groups.len() > top {
+        println!("... and {} more groups", groups.len() - top);
+    }
+    Ok(())
 }
 
 /// Set by the signal handler; polled by a watcher thread that pauses the run.

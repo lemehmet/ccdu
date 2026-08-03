@@ -7,8 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use ccdu_core::dup::{self, DupGroup, DupOptions, DupProgress};
 use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, Outcome};
 use ccdu_core::format::human_size;
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
@@ -59,6 +61,8 @@ impl Graph {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Browse,
+    /// Files with identical contents, worst waste first.
+    Dupes,
     Plan,
     /// The last chance to back out. Deliberately its own screen rather than a keystroke away from
     /// the plan, because this is the only irreversible thing ccdu does.
@@ -91,6 +95,42 @@ impl Running {
 
     pub fn is_pausing(&self) -> bool {
         self.control.is_paused() && self.summary.is_none()
+    }
+}
+
+/// A duplicate scan, running or finished.
+pub struct Dupes {
+    pub groups: Vec<DupGroup>,
+    /// Flattened for display: a header per group, then its files.
+    pub rows: Vec<DupRow>,
+    pub cursor: usize,
+    pub latest: DupProgress,
+    result: Option<Receiver<Vec<DupGroup>>>,
+    progress: Receiver<DupProgress>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DupRow {
+    Header(usize),
+    File(usize, NodeId),
+}
+
+impl Dupes {
+    pub fn is_scanning(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// The file under the cursor, if the cursor is on one.
+    pub fn selected(&self) -> Option<(usize, NodeId)> {
+        match self.rows.get(self.cursor) {
+            Some(DupRow::File(group, id)) => Some((*group, *id)),
+            _ => None,
+        }
+    }
+
+    pub fn stop(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -142,6 +182,10 @@ pub enum Action {
     SavePlan,
     Commit,
     Confirm,
+    ToggleTreemap,
+    ToggleDupes,
+    /// Stage every copy in the selected group except the one being kept.
+    StageGroupRest,
     Input(char),
     Backspace,
     Submit,
@@ -150,7 +194,7 @@ pub enum Action {
 }
 
 pub struct App {
-    pub tree: Tree,
+    pub tree: Arc<Tree>,
     pub dir: NodeId,
     pub cursor: usize,
     pub rows: Vec<NodeId>,
@@ -181,8 +225,26 @@ pub struct App {
     pub run: Option<Running>,
     /// Set once a commit has removed things: the tree in memory no longer describes the disk.
     pub stale: bool,
+    /// Show the treemap beside the listing.
+    pub show_treemap: bool,
+    pub dupes: Option<Dupes>,
 
     remembered: HashMap<NodeId, usize>,
+}
+
+/// Move the cursor to the next row holding a file, skipping group headers. Stays put when there
+/// is nowhere to go.
+fn next_file(rows: &[DupRow], from: usize, step: isize) -> usize {
+    let mut at = from as isize;
+    loop {
+        at += step;
+        if at < 0 || at as usize >= rows.len() {
+            return from;
+        }
+        if matches!(rows[at as usize], DupRow::File(..)) {
+            return at as usize;
+        }
+    }
 }
 
 fn plural(n: usize) -> &'static str {
@@ -197,7 +259,9 @@ impl App {
     pub fn new(tree: Tree) -> Self {
         let root = tree.root_path().to_path_buf();
         let mut app = App {
-            tree,
+            // Shared so a duplicate scan can read it from another thread while the browser keeps
+            // drawing. Nothing mutates the tree after the scan that produced it.
+            tree: Arc::new(tree),
             dir: ROOT,
             cursor: 0,
             rows: Vec::new(),
@@ -220,6 +284,8 @@ impl App {
             store: Store::open_default(),
             run: None,
             stale: false,
+            show_treemap: false,
+            dupes: None,
             remembered: HashMap::new(),
         };
         app.rebuild_rows();
@@ -318,6 +384,7 @@ impl App {
             return;
         }
         match self.view {
+            View::Dupes => return self.dupes_key(action),
             View::Plan => return self.plan_key(action),
             View::Confirm => return self.confirm_key(action),
             View::Running => return self.running_key(action),
@@ -356,6 +423,8 @@ impl App {
                 }
             }
             Action::CycleGraph => self.graph = self.graph.next(),
+            Action::ToggleTreemap => self.show_treemap = !self.show_treemap,
+            Action::ToggleDupes => self.start_dupes(),
             Action::ToggleInfo => self.show_info = self.selected().is_some(),
             Action::ToggleHelp => self.show_help = true,
             Action::Mark => self.toggle_mark(),
@@ -374,11 +443,162 @@ impl App {
             // review screen is the safety, so it is not optional.
             Action::Commit => self.open_plan(),
             Action::Confirm
+            | Action::StageGroupRest
             | Action::Input(_)
             | Action::Backspace
             | Action::Submit
             | Action::Dismiss => {}
         }
+    }
+
+    /// Start a duplicate scan on a background thread and switch to its view.
+    fn start_dupes(&mut self) {
+        if self.dupes.as_ref().is_some_and(|d| d.is_scanning()) {
+            self.view = View::Dupes;
+            return;
+        }
+
+        let tree = Arc::clone(&self.tree);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (progress_tx, progress) = crossbeam_channel::unbounded();
+        let (result_tx, result) = crossbeam_channel::bounded(1);
+
+        let worker_cancel = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            let groups = dup::find_duplicates(
+                &tree,
+                &DupOptions::default(),
+                Some(&progress_tx),
+                Some(&worker_cancel),
+            );
+            result_tx.send(groups).ok();
+        });
+
+        self.dupes = Some(Dupes {
+            groups: Vec::new(),
+            rows: Vec::new(),
+            cursor: 0,
+            latest: DupProgress::default(),
+            result: Some(result),
+            progress,
+            cancel,
+        });
+        self.view = View::Dupes;
+        self.status = None;
+    }
+
+    /// Collect whatever the duplicate scan has reported. Called once per frame.
+    pub fn poll_dupes(&mut self) {
+        let Some(dupes) = self.dupes.as_mut() else { return };
+        if let Some(latest) = dupes.progress.try_iter().last() {
+            dupes.latest = latest;
+        }
+        let Some(result) = dupes.result.as_ref() else { return };
+        let Ok(groups) = result.try_recv() else { return };
+
+        dupes.result = None;
+        dupes.rows = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(i, group)| {
+                std::iter::once(DupRow::Header(i))
+                    .chain(group.nodes.iter().map(move |&id| DupRow::File(i, id)))
+            })
+            .collect();
+        dupes.groups = groups;
+        // Start on the first file rather than the header above it.
+        dupes.cursor = dupes.rows.iter().position(|r| matches!(r, DupRow::File(..))).unwrap_or(0);
+    }
+
+    fn dupes_key(&mut self, action: Action) {
+        let Some(dupes) = self.dupes.as_mut() else {
+            self.view = View::Browse;
+            return;
+        };
+        match action {
+            // Headers are labels, not choices; the cursor passes over them.
+            Action::Down => dupes.cursor = next_file(&dupes.rows, dupes.cursor, 1),
+            Action::Up => dupes.cursor = next_file(&dupes.rows, dupes.cursor, -1),
+            Action::PageDown => {
+                for _ in 0..10 {
+                    dupes.cursor = next_file(&dupes.rows, dupes.cursor, 1);
+                }
+            }
+            Action::PageUp => {
+                for _ in 0..10 {
+                    dupes.cursor = next_file(&dupes.rows, dupes.cursor, -1);
+                }
+            }
+            Action::Top => {
+                dupes.cursor =
+                    dupes.rows.iter().position(|r| matches!(r, DupRow::File(..))).unwrap_or(0)
+            }
+            Action::Bottom => {
+                dupes.cursor =
+                    dupes.rows.iter().rposition(|r| matches!(r, DupRow::File(..))).unwrap_or(0)
+            }
+            Action::Mark => {
+                if let Some((_, id)) = dupes.selected() {
+                    if !self.marks.remove(&id) {
+                        self.marks.insert(id);
+                    }
+                    let dupes = self.dupes.as_mut().expect("checked above");
+                    dupes.cursor = next_file(&dupes.rows, dupes.cursor, 1);
+                }
+            }
+            Action::StageDelete => self.stage_from_dupes(),
+            Action::StageGroupRest => self.stage_group_rest(),
+            Action::Unstage => {
+                if let Some((_, id)) = dupes.selected() {
+                    self.staged.remove(&id);
+                    self.status = Some("unstaged".to_string());
+                }
+            }
+            Action::TogglePlan => self.open_plan(),
+            Action::ToggleHelp => self.show_help = true,
+            Action::ToggleDupes | Action::Dismiss | Action::Quit | Action::Leave => {
+                dupes.stop();
+                self.view = View::Browse;
+            }
+            _ => {}
+        }
+    }
+
+    fn stage_from_dupes(&mut self) {
+        let targets: Vec<NodeId> = if self.marks.is_empty() {
+            self.dupes.as_ref().and_then(|d| d.selected()).map(|(_, id)| id).into_iter().collect()
+        } else {
+            self.marks.iter().copied().collect()
+        };
+        self.stage_all(&targets);
+    }
+
+    /// Stage every copy in the group under the cursor except the first, which is kept.
+    fn stage_group_rest(&mut self) {
+        let Some((group, _)) = self.dupes.as_ref().and_then(|d| d.selected()) else { return };
+        let Some(group) = self.dupes.as_ref().and_then(|d| d.groups.get(group)) else { return };
+        // Skipping the first is what makes this safe: a bulk action that could empty a group is
+        // not a labour saver, it is a way to lose the only copy.
+        let targets: Vec<NodeId> = group.nodes.iter().skip(1).copied().collect();
+        self.stage_all(&targets);
+    }
+
+    fn stage_all(&mut self, targets: &[NodeId]) {
+        let mut staged = 0;
+        for &id in targets {
+            match self.record(id, StagedKind::Delete) {
+                Ok(()) => staged += 1,
+                Err(message) => {
+                    self.status = Some(message);
+                    return;
+                }
+            }
+        }
+        self.marks.clear();
+        self.status = Some(format!(
+            "staged {staged} for deletion ({} total)",
+            human_size(self.staged_bytes())
+        ));
     }
 
     fn enter(&mut self) {
@@ -1156,6 +1376,131 @@ mod tests {
         app.apply(Action::Commit);
         assert_eq!(app.view, View::Plan);
         assert!(dir.path().join("big").exists());
+    }
+
+    /// Drive a duplicate scan to completion, polling the way the event loop does.
+    fn find_dupes(app: &mut App) {
+        app.apply(Action::ToggleDupes);
+        assert_eq!(app.view, View::Dupes);
+        for _ in 0..2000 {
+            app.poll_dupes();
+            if app.dupes.as_ref().is_some_and(|d| !d.is_scanning()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("duplicate scan never finished");
+    }
+
+    /// Three copies of one file plus an unrelated one.
+    fn dup_fixture() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        for name in ["copy-a", "sub/copy-b", "sub/copy-c"] {
+            fs::write(root.join(name), vec![8u8; 30_000]).unwrap();
+        }
+        fs::write(root.join("unique"), vec![9u8; 30_001]).unwrap();
+
+        let tree = scan(root, &ScanOptions::default(), None, None).unwrap();
+        (dir, App::new(tree))
+    }
+
+    #[test]
+    fn the_duplicates_view_groups_identical_files() {
+        let (_d, mut app) = dup_fixture();
+        find_dupes(&mut app);
+
+        let dupes = app.dupes.as_ref().unwrap();
+        assert_eq!(dupes.groups.len(), 1, "{:?}", dupes.groups);
+        assert_eq!(dupes.groups[0].nodes.len(), 3);
+        // One header plus three files.
+        assert_eq!(dupes.rows.len(), 4);
+        assert!(matches!(dupes.rows[0], DupRow::Header(0)));
+    }
+
+    #[test]
+    fn the_cursor_skips_group_headers() {
+        let (_d, mut app) = dup_fixture();
+        find_dupes(&mut app);
+
+        // It starts on a file, not the header above it.
+        assert!(app.dupes.as_ref().unwrap().selected().is_some());
+        for _ in 0..5 {
+            app.apply(Action::Down);
+            assert!(
+                app.dupes.as_ref().unwrap().selected().is_some(),
+                "the cursor landed on a header"
+            );
+        }
+        for _ in 0..10 {
+            app.apply(Action::Up);
+            assert!(app.dupes.as_ref().unwrap().selected().is_some());
+        }
+    }
+
+    #[test]
+    fn staging_all_but_the_first_never_empties_a_group() {
+        let (dir, mut app) = dup_fixture();
+        find_dupes(&mut app);
+
+        app.apply(Action::StageGroupRest);
+
+        assert_eq!(app.staged.len(), 2, "one copy must survive");
+        let kept = app.dupes.as_ref().unwrap().groups[0].nodes[0];
+        assert!(!app.staged.contains_key(&kept), "the kept copy was staged for deletion");
+        // Still nothing on disk has changed.
+        assert!(dir.path().join("copy-a").exists());
+    }
+
+    #[test]
+    fn marking_in_the_duplicates_view_stages_those_copies() {
+        let (_d, mut app) = dup_fixture();
+        find_dupes(&mut app);
+
+        app.apply(Action::Mark);
+        app.apply(Action::Mark);
+        app.apply(Action::StageDelete);
+
+        assert_eq!(app.staged.len(), 2);
+        assert!(app.marks.is_empty());
+    }
+
+    #[test]
+    fn duplicates_can_be_staged_and_then_reviewed_as_a_plan() {
+        let (_d, mut app) = dup_fixture();
+        find_dupes(&mut app);
+
+        app.apply(Action::StageGroupRest);
+        app.apply(Action::TogglePlan);
+
+        assert_eq!(app.view, View::Plan);
+        assert_eq!(app.plan.ops.len(), 2);
+        assert!(app.plan.ops.iter().all(|op| op.is_delete()));
+        assert!(!app.has_errors(), "{:?}", app.findings);
+    }
+
+    #[test]
+    fn leaving_the_duplicates_view_returns_to_the_browser() {
+        let (_d, mut app) = dup_fixture();
+        find_dupes(&mut app);
+        app.apply(Action::Dismiss);
+        assert_eq!(app.view, View::Browse);
+        assert!(!app.quit, "leaving a subview should not quit the program");
+    }
+
+    #[test]
+    fn the_treemap_toggles_without_disturbing_the_listing() {
+        let (_d, mut app) = fixture();
+        let before = app.rows.clone();
+        assert!(!app.show_treemap);
+
+        app.apply(Action::ToggleTreemap);
+        assert!(app.show_treemap);
+        assert_eq!(app.rows, before);
+
+        app.apply(Action::ToggleTreemap);
+        assert!(!app.show_treemap);
     }
 
     #[test]
