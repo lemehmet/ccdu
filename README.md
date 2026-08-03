@@ -13,7 +13,7 @@ Early development. See the milestone table below.
 |---|---|---|
 | M0 | Workspace skeleton, CI | done |
 | M1 | Scanner, arena tree, hardlink accounting | done |
-| M2 | TUI browser | |
+| M2 | TUI browser | done |
 | M3 | Staging, plan persistence, validation | |
 | M4 | Executor: deletes, journal, pause/resume | |
 | M5 | Moves: same-fs, reflink, cross-device | |
@@ -23,11 +23,26 @@ Early development. See the milestone table below.
 ## Try it
 
 ```sh
-cargo run --release -- /some/path          # summary + largest entries
-cargo run --release -- -x -t8 --top 30 /   # one filesystem, 8 threads
+cargo run --release -- /some/path            # scan, then browse
+cargo run --release -- -x -t8 /              # one filesystem, 8 threads
+cargo run --release -- scan --top 30 /usr    # headless: summary + largest entries
 ```
 
-Sizes are `st_blocks * 512` (what freeing the file actually returns) unless you pass `-a`, and
+A long scan can be cut short with `q` — you drop straight into the browser with whatever was
+found so far, marked `[partial scan]` so the totals are not mistaken for the whole picture.
+
+### Keys
+
+| | |
+|---|---|
+| `↑ ↓ j k`, `PgUp` `PgDn`, `Home` `End` | move |
+| `⏎` `→` `l` / `←` `h` `Backspace` | open a directory / go up |
+| `s` `n` `C` `M` | sort by size, name, item count, mtime (again to reverse) |
+| `a` | apparent size vs disk usage |
+| `g` | cycle graph: bar, percent, both, off |
+| `i` / `?` / `q` | details / keys / quit |
+
+Sizes are `st_blocks * 512` (what freeing the file actually returns) unless you press `a`, and
 hardlinked files are counted once. `ccdu` matches `du -s --block-size=1` on the trees it has been
 checked against, at roughly a third of the wall time on 8 threads.
 

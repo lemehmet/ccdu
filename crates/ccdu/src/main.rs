@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use ccdu_core::format::human_size;
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
 use ccdu_core::scan::{scan, Progress, ScanOptions};
 use clap::{Args, Parser, Subcommand};
@@ -26,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scan a directory and print a usage summary.
+    /// Scan a directory and print a usage summary instead of opening the browser.
     Scan(ScanArgs),
 }
 
@@ -58,14 +59,20 @@ struct ScanArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let args = match cli.command {
-        Some(Command::Scan(args)) => args,
-        None => cli.scan,
-    };
-    run_scan(args)
+    match cli.command {
+        Some(Command::Scan(args)) => report(args),
+        None => browse(cli.scan),
+    }
 }
 
-fn run_scan(args: ScanArgs) -> Result<()> {
+/// Default behaviour: scan and open the browser.
+fn browse(args: ScanArgs) -> Result<()> {
+    let (path, opts) = prepare(&args)?;
+    ccdu_tui::run(path, opts).context("terminal interface")
+}
+
+/// Resolve the scan root and turn command line flags into scan options.
+fn prepare(args: &ScanArgs) -> Result<(PathBuf, ScanOptions)> {
     let path = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
     let path = path.canonicalize().with_context(|| format!("cannot access {}", path.display()))?;
 
@@ -77,13 +84,20 @@ fn run_scan(args: ScanArgs) -> Result<()> {
     if let Some(threads) = args.threads {
         opts.threads = threads.max(1);
     }
+    Ok((path, opts))
+}
+
+/// Headless mode: scan and print a summary, for scripts and for machines without a usable
+/// terminal.
+fn report(args: ScanArgs) -> Result<()> {
+    let (path, opts) = prepare(&args)?;
 
     let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
     let reporter = std::thread::spawn(move || report_progress(rx));
 
     let started = Instant::now();
-    let tree =
-        scan(&path, &opts, Some(&tx)).with_context(|| format!("scanning {}", path.display()))?;
+    let tree = scan(&path, &opts, Some(&tx), None)
+        .with_context(|| format!("scanning {}", path.display()))?;
     drop(tx);
     reporter.join().ok();
 
@@ -106,7 +120,7 @@ fn report_progress(rx: crossbeam_channel::Receiver<Progress>) {
             "\r\x1b[2Kscanning {} entries in {} dirs, {}",
             p.entries,
             p.dirs,
-            human(p.disk)
+            human_size(p.disk)
         );
         let _ = stderr.flush();
     }
@@ -131,7 +145,7 @@ fn print_report(tree: &Tree, args: &ScanArgs, elapsed: std::time::Duration) {
     println!(
         "  {:<12} {}",
         if args.apparent { "apparent" } else { "disk usage" },
-        human(size_of(ROOT))
+        human_size(size_of(ROOT))
     );
     println!("  {:<12} {}", "entries", root.items);
     println!(
@@ -139,7 +153,7 @@ fn print_report(tree: &Tree, args: &ScanArgs, elapsed: std::time::Duration) {
         "scanned in",
         elapsed.as_secs_f64(),
         tree.len(),
-        human(tree.memory_bytes() as u64)
+        human_size(tree.memory_bytes() as u64)
     );
     if tree.errors > 0 {
         println!("  {:<12} {} (sizes are a lower bound)", "unreadable", tree.errors);
@@ -157,7 +171,7 @@ fn print_report(tree: &Tree, args: &ScanArgs, elapsed: std::time::Duration) {
         let marker = if node.is_dir() { "/" } else { "" };
         println!(
             "{:>10}  {}{}{}",
-            human(size_of(id)),
+            human_size(size_of(id)),
             tree.name(id).to_string_lossy(),
             marker,
             annotations(node.flags)
@@ -190,20 +204,5 @@ fn annotations(f: u16) -> String {
         String::new()
     } else {
         format!("  [{}]", notes.join(", "))
-    }
-}
-
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }

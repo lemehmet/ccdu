@@ -118,12 +118,15 @@ pub struct Tree {
     root_path: PathBuf,
     /// Entries that could not be read or stat'd.
     pub errors: u64,
+    /// The scan was stopped early, so these totals are a lower bound on what is really there.
+    pub cancelled: bool,
 }
 
 impl Tree {
     /// Create a tree containing only its root.
     pub fn new(root_path: PathBuf, meta: &Meta) -> Self {
-        let mut tree = Tree { nodes: Vec::new(), names: Vec::new(), root_path, errors: 0 };
+        let mut tree =
+            Tree { nodes: Vec::new(), names: Vec::new(), root_path, errors: 0, cancelled: false };
         let name = tree.intern(b"");
         tree.nodes.push(Node {
             apparent: meta.apparent,

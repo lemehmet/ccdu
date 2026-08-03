@@ -11,7 +11,7 @@
 use std::ffi::CStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use rustix::fd::OwnedFd;
@@ -64,10 +64,14 @@ pub struct Progress {
 /// Scan `root`, returning the assembled tree.
 ///
 /// `progress` receives an update every so often; if the receiver is gone, the scan continues.
+///
+/// Setting `cancel` stops the scan at the next directory boundary and returns the partial tree
+/// with [`Tree::cancelled`] set — totals for what was already walked stay correct.
 pub fn scan(
     root: &Path,
     opts: &ScanOptions,
     progress: Option<&Sender<Progress>>,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<Tree> {
     let root_stat = statat(CWD, root, AtFlags::SYMLINK_NOFOLLOW).map_err(errno_to_io)?;
     let root_meta = meta_from_stat(&root_stat);
@@ -81,6 +85,7 @@ pub fn scan(
         opts: opts.clone(),
         root_dev: root_meta.dev,
         budget: FdBudget { count: AtomicUsize::new(0), max: opts.max_open_dirs },
+        cancel,
     };
 
     let (task_tx, task_rx) = unbounded::<Task>();
@@ -96,6 +101,11 @@ pub fn scan(
             let ctx = &ctx;
             scope.spawn(move || {
                 for task in task_rx {
+                    // Checked here as well as inside `read_dir` so a cancelled scan does not have
+                    // to drain a queue that may already hold thousands of directories.
+                    if ctx.cancelled() {
+                        break;
+                    }
                     if res_tx.send(read_dir(task, ctx)).is_err() {
                         break;
                     }
@@ -111,6 +121,10 @@ pub fn scan(
         let mut since_report = 0u32;
 
         while outstanding > 0 {
+            if ctx.cancelled() {
+                tree.cancelled = true;
+                break;
+            }
             let Ok(result) = res_rx.recv() else { break };
             outstanding -= 1;
             outstanding += state.absorb(&mut tree, result, &task_tx);
@@ -138,10 +152,17 @@ pub fn scan(
 }
 
 /// Immutable per-scan state shared by every worker.
-struct Ctx {
+struct Ctx<'a> {
     opts: ScanOptions,
     root_dev: u64,
     budget: FdBudget,
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl Ctx<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
 }
 
 /// Caps how many directory descriptors the pending queue holds at once.
@@ -228,7 +249,14 @@ fn read_dir(task: Task, ctx: &Ctx) -> DirResult {
         }
     };
 
+    let mut seen = 0u32;
     while let Some(entry) = dir.read() {
+        // A single directory can hold millions of entries; give cancellation a chance to land
+        // without checking an atomic on every one of them.
+        seen += 1;
+        if seen.is_multiple_of(512) && ctx.cancelled() {
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
@@ -297,7 +325,7 @@ fn finish_task(out: &DirResult, ctx: &Ctx) {
 
 /// Builder-thread state: everything that must be decided globally rather than per directory.
 struct Builder<'a> {
-    ctx: &'a Ctx,
+    ctx: &'a Ctx<'a>,
     /// `(dev, ino)` of every file with `nlink > 1` already counted, so its other links are free.
     hardlinks: std::collections::HashSet<(u64, u64)>,
     /// `(dev, ino)` of every directory entered, which stops bind-mount loops from being scanned
@@ -308,7 +336,7 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(ctx: &'a Ctx) -> Self {
+    fn new(ctx: &'a Ctx<'a>) -> Self {
         Builder {
             ctx,
             hardlinks: std::collections::HashSet::new(),
@@ -382,7 +410,7 @@ impl<'a> Builder<'a> {
             }
         }
 
-        if self.dirs % 64 == 0 {
+        if self.dirs.is_multiple_of(64) {
             self.last_dir = tree.path_of(result.id);
         }
         queued
@@ -456,7 +484,7 @@ mod tests {
         fs::write(root.join("a/small"), b"hi").unwrap();
         fs::create_dir(root.join("empty")).unwrap();
 
-        let tree = scan(root, &opts(), None).unwrap();
+        let tree = scan(root, &opts(), None, None).unwrap();
         let found = collect(&tree);
 
         assert!(found.contains_key("a/b/big"));
@@ -476,7 +504,7 @@ mod tests {
         fs::hard_link(root.join("original"), root.join("link1")).unwrap();
         fs::hard_link(root.join("original"), root.join("link2")).unwrap();
 
-        let tree = scan(root, &opts(), None).unwrap();
+        let tree = scan(root, &opts(), None, None).unwrap();
 
         let total: u64 = tree.children(ROOT).map(|c| tree.node(c).disk).sum();
         assert_eq!(total, 16384, "three links to one inode must count as one file");
@@ -494,7 +522,7 @@ mod tests {
         // A link back to the root: following it would recurse forever.
         unix_fs::symlink(root, root.join("real/loop")).unwrap();
 
-        let tree = scan(root, &opts(), None).unwrap();
+        let tree = scan(root, &opts(), None, None).unwrap();
         let found = collect(&tree);
 
         assert!(found.contains_key("real/loop"));
@@ -514,7 +542,7 @@ mod tests {
         fs::write(root.join("keep"), vec![0u8; 1024]).unwrap();
 
         let o = ScanOptions { exclude_names: vec![b"node_modules".to_vec()], ..opts() };
-        let tree = scan(root, &o, None).unwrap();
+        let tree = scan(root, &o, None, None).unwrap();
         let found = collect(&tree);
 
         assert!(found.contains_key("node_modules"));
@@ -535,7 +563,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("visible"), vec![0u8; 512]).unwrap();
 
-        let tree = scan(root, &opts(), None).unwrap();
+        let tree = scan(root, &opts(), None, None).unwrap();
 
         // Running as root defeats the permission bits; only assert when they actually bite.
         let locked =
@@ -564,11 +592,39 @@ mod tests {
 
         // A budget of one forces almost every subdirectory down the reopen-by-path path.
         let o = ScanOptions { max_open_dirs: 1, threads: 4, ..Default::default() };
-        let tree = scan(root, &o, None).unwrap();
+        let tree = scan(root, &o, None, None).unwrap();
         let found = collect(&tree);
 
         assert_eq!(found.keys().filter(|k| k.ends_with("/f")).count(), 40);
         assert_eq!(tree.errors, 0);
+    }
+
+    #[test]
+    fn cancelling_returns_a_partial_but_consistent_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..200 {
+            let d = root.join(format!("d{i:03}"));
+            fs::create_dir(&d).unwrap();
+            for j in 0..20 {
+                fs::write(d.join(format!("f{j}")), vec![0u8; 4096]).unwrap();
+            }
+        }
+
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let tree = scan(root, &opts(), None, Some(&cancel)).unwrap();
+
+        assert!(tree.cancelled);
+        assert!(tree.len() < 200 * 21, "cancellation did not stop the walk");
+
+        // Whatever was walked is still coherent: every node's counts are exactly the sum of its
+        // children's, and its size is at least theirs.
+        for id in 0..tree.len() as NodeId {
+            let items: u32 = tree.children(id).map(|c| tree.node(c).items + 1).sum();
+            let disk: u64 = tree.children(id).map(|c| tree.node(c).disk).sum();
+            assert_eq!(tree.node(id).items, items, "items mismatch at node {id}");
+            assert!(tree.node(id).disk >= disk, "size mismatch at node {id}");
+        }
     }
 
     #[test]
@@ -577,7 +633,7 @@ mod tests {
         let path = dir.path().join("lonely");
         fs::write(&path, vec![0u8; 300]).unwrap();
 
-        let tree = scan(&path, &opts(), None).unwrap();
+        let tree = scan(&path, &opts(), None, None).unwrap();
         assert_eq!(tree.len(), 1);
         assert_eq!(tree.node(ROOT).apparent, 300);
     }
