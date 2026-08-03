@@ -42,7 +42,7 @@ found so far, marked `[partial scan]` so the totals are not mistaken for the who
 | `g` | cycle graph: bar, percent, both, off |
 | `Space` | mark an entry; `d`/`m`/`u` then apply to every mark |
 | `d` / `m` / `u` | stage a deletion / a move / unstage |
-| `p` / `w` | review the plan / write it to the plan store |
+| `p` / `w` / `c` | review the plan / write it to the plan store / commit |
 | `i` / `?` / `q` | details / keys / quit |
 
 ## Staging
@@ -111,6 +111,12 @@ idempotent, a premature claim costs one wasted check rather than a file. Deletio
 `*at` syscalls on a directory descriptor the executor opened itself, so a path swapped mid-run
 cannot redirect it, and an unwritable directory is detected before its contents are gone rather
 than after.
+
+In the browser, `c` opens the plan, and `c` again from there asks for confirmation on its own
+screen — the review step is the safety, so committing is never one keystroke from browsing. A
+commit running in the TUI can be paused with `p` and continued later with `ccdu resume`. Once it
+has run, the listing describes a disk that no longer exists, and says so rather than showing
+numbers that are quietly wrong.
 
 Moves are refused until M5, as a whole plan rather than half way through one.
 

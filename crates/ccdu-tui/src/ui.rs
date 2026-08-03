@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{App, Graph, StagedKind, View};
+use ccdu_core::plan::Plan;
 
 const BAR_WIDTH: usize = 12;
 
@@ -53,9 +54,13 @@ pub fn draw(frame: &mut Frame, app: &App, list_state: &mut ListState) {
             draw_header(frame, app, header);
             draw_listing(frame, app, body, list_state);
         }
-        View::Plan => {
+        View::Plan | View::Confirm => {
             draw_plan_header(frame, app, header);
             draw_plan(frame, app, body, list_state);
+        }
+        View::Running => {
+            draw_running_header(frame, app, header);
+            draw_running(frame, app, body);
         }
     }
     draw_footer(frame, app, footer);
@@ -69,37 +74,157 @@ pub fn draw(frame: &mut Frame, app: &App, list_state: &mut ListState) {
     if app.prompt.is_some() {
         draw_prompt(frame, app);
     }
+    if app.view == View::Confirm {
+        draw_confirm(frame, &app.plan);
+    }
+}
+
+/// The last screen before anything is destroyed. It states the cost in the plainest terms
+/// available and defaults to no.
+fn draw_confirm(frame: &mut Frame, plan: &Plan) {
+    let lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  About to run "),
+            Span::styled(format!("{} operations", plan.ops.len()), Style::new().bold()),
+            Span::raw(" under "),
+            Span::styled(plan.root.display().to_string(), Style::new().bold()),
+            Span::raw("."),
+        ]),
+        Line::from(vec![
+            Span::raw("  This reclaims about "),
+            Span::styled(human_size(plan.delete_bytes()), Style::new().fg(Color::Green).bold()),
+            Span::raw(" and "),
+            Span::styled("cannot be undone", Style::new().fg(Color::Red).bold()),
+            Span::raw("."),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  y", Style::new().fg(Color::Red).bold()),
+            Span::raw(" to commit          "),
+            Span::styled("Esc", Style::new().fg(Color::Cyan).bold()),
+            Span::raw(" to go back"),
+        ]),
+        Line::raw(""),
+    ];
+
+    let area = centered(frame.area(), 78, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" commit ")
+                .border_style(Style::new().fg(Color::Red)),
+        ),
+        area,
+    );
+}
+
+fn draw_running_header(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(run) = &app.run else { return };
+    let (label, style) = if run.is_finished() {
+        (" done ", Style::new().bg(Color::Green).fg(Color::Black).bold())
+    } else if run.is_pausing() {
+        (" pausing ", Style::new().bg(Color::Yellow).fg(Color::Black).bold())
+    } else {
+        (" running ", Style::new().bg(Color::Red).fg(Color::White).bold())
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(label, style),
+            Span::raw("  "),
+            Span::raw(format!("{} of {} operations", run.completed, run.total)),
+        ])),
+        area,
+    );
+}
+
+fn draw_running(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(run) = &app.run else { return };
+
+    // Keep the newest lines visible; a long commit will outrun the viewport.
+    let height = area.height.saturating_sub(3) as usize;
+    let start = run.log.len().saturating_sub(height);
+    let mut lines: Vec<Line> = run.log[start..]
+        .iter()
+        .map(|entry| {
+            let style =
+                if entry.contains("FAILED") { Style::new().fg(Color::Red) } else { Style::new() };
+            Line::styled(format!(" {entry}"), style)
+        })
+        .collect();
+
+    if let Some(summary) = &run.summary {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(format!(" {summary}"), Style::new().bold()));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let node = app.tree.node(app.dir);
+
+    // The markers are built first and the path is given whatever width is left. A deep path is
+    // easy to come by, and it must not be the thing that pushes "this is stale" off the screen.
+    let totals = format!(
+        "  {} in {} items",
+        human_size(app.size_of(app.dir)),
+        human_count(node.items as u64)
+    );
     let mut spans = vec![
         Span::styled(" ccdu ", Style::new().bg(Color::Cyan).fg(Color::Black).bold()),
         Span::raw(" "),
-        Span::styled(app.tree.path_of(app.dir).display().to_string(), Style::new().bold()),
-        Span::raw("  "),
-        Span::raw(format!(
-            "{} in {} items",
-            human_size(app.size_of(app.dir)),
-            human_count(node.items as u64)
-        )),
     ];
+    let mut trailing = Vec::new();
+    if app.stale {
+        trailing.push(Span::styled("  [stale]", Style::new().fg(Color::Yellow).bold()));
+    }
     if app.tree.cancelled {
-        spans.push(Span::styled("  [partial scan]", Style::new().fg(Color::Yellow)));
+        trailing.push(Span::styled("  [partial]", Style::new().fg(Color::Yellow)));
     }
     if app.tree.errors > 0 {
-        spans.push(Span::styled(
+        trailing.push(Span::styled(
             format!("  [{} unreadable]", app.tree.errors),
             Style::new().fg(Color::Red),
         ));
     }
     if !app.staged.is_empty() {
-        spans.push(Span::styled(
+        trailing.push(Span::styled(
             format!("  [{} staged, {}]", app.staged.len(), human_size(app.staged_bytes())),
             Style::new().fg(Color::Magenta).bold(),
         ));
     }
+
+    // Markers are terse and come first in the budget; the path is elided to fit, and the totals
+    // are dropped entirely before a warning is allowed to fall off the end.
+    const MIN_PATH: usize = 8;
+    let markers: usize = trailing.iter().map(|s| s.content.chars().count()).sum();
+    let width = area.width as usize;
+    let after_markers = width.saturating_sub(7 + markers);
+    let show_totals = after_markers >= MIN_PATH + totals.chars().count();
+
+    let room = if show_totals { after_markers - totals.chars().count() } else { after_markers };
+    let path = elide_left(&app.tree.path_of(app.dir).display().to_string(), room.max(MIN_PATH));
+
+    spans.push(Span::styled(path, Style::new().bold()));
+    if show_totals {
+        spans.push(Span::raw(totals));
+    }
+    spans.extend(trailing);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Shorten a path from the front, keeping the end. The tail is the part that says where you are;
+/// the root is usually what you already know.
+fn elide_left(text: &str, max: usize) -> String {
+    let len = text.chars().count();
+    if len <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    format!("…{}", text.chars().skip(len - keep).collect::<String>())
 }
 
 fn draw_listing(frame: &mut Frame, app: &App, area: Rect, list_state: &mut ListState) {
@@ -333,6 +458,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let (left, right) = match app.view {
+        // Once a commit has run, what the listing shows is history. That outranks the sort
+        // settings, and unlike a status message it cannot be cleared by the next keystroke.
+        View::Browse if app.stale => (
+            " these sizes are from before the commit — rerun ccdu to rescan".to_string(),
+            "q quit ",
+        ),
         View::Browse => (
             format!(
                 " sort: {}{}  size: {}",
@@ -344,8 +475,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ),
         View::Plan => (
             format!(" {} staged", app.staged.len()),
-            "↑↓ move  u unstage  w write plan  p back  ? help  q back ",
+            "↑↓ move  u unstage  c commit  w write plan  p back  ? help  q back ",
         ),
+        View::Confirm => (" confirm".to_string(), "y commit  Esc go back "),
+        View::Running => match app.run.as_ref() {
+            Some(run) if run.is_finished() => (String::new(), "q back to the browser "),
+            _ => (String::new(), "p pause — a paused commit can be resumed "),
+        },
     };
 
     // Widths are in characters, not bytes — the arrows and the return symbol are multi-byte. If
@@ -459,17 +595,24 @@ fn draw_help(frame: &mut Frame, view: View) {
         ("u / p", "unstage / open the plan"),
         ("q Esc", "quit"),
     ];
-    const PLAN: [(&str, &str); 5] = [
+    const PLAN: [(&str, &str); 6] = [
         ("↑ ↓ j k", "move the cursor"),
         ("u", "unstage the selected operation"),
         ("w", "write the plan to the plan store"),
+        ("c", "commit — the only step that changes anything"),
         ("p Esc q", "back to the browser"),
-        ("", "nothing here has touched the disk yet"),
+        ("", "everything before c is reversible"),
+    ];
+    const RUNNING: [(&str, &str); 3] = [
+        ("p", "pause; the run can be resumed later"),
+        ("q Esc", "back to the browser, once it has finished"),
+        ("", "a paused or crashed run continues with `ccdu resume`"),
     ];
 
     let keys: &[(&str, &str)] = match view {
         View::Browse => &BROWSE,
-        View::Plan => &PLAN,
+        View::Plan | View::Confirm => &PLAN,
+        View::Running => &RUNNING,
     };
     let lines: Vec<Line> = keys
         .iter()

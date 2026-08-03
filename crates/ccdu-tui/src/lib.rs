@@ -77,6 +77,8 @@ fn browse(terminal: &mut DefaultTerminal, tree: Tree) -> io::Result<()> {
     let mut list_state = ListState::default();
 
     while !app.quit {
+        // A commit runs on its own thread; this is where its progress reaches the screen.
+        app.poll_run();
         terminal.draw(|frame| ui::draw(frame, &app, &mut list_state))?;
 
         if !event::poll(TICK)? {
@@ -141,6 +143,8 @@ fn translate(key: &KeyEvent, prompting: bool) -> Option<Action> {
         KeyCode::Char('u') => Action::Unstage,
         KeyCode::Char('p') => Action::TogglePlan,
         KeyCode::Char('w') => Action::SavePlan,
+        KeyCode::Char('c') => Action::Commit,
+        KeyCode::Char('y') => Action::Confirm,
         KeyCode::Esc => Action::Dismiss,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
@@ -220,6 +224,44 @@ mod tests {
         assert!(out.contains("info"), "{out}");
         assert!(out.contains("disk usage"), "{out}");
         assert!(out.contains("modified"), "{out}");
+    }
+
+    /// A warning must never be the thing that falls off the end of the header. The path gives way
+    /// first, then the totals.
+    #[test]
+    fn header_markers_survive_a_narrow_terminal() {
+        let (_d, mut app) = fixture();
+        app.stale = true;
+        app.apply(Action::StageDelete);
+
+        for width in [100u16, 80, 60, 44] {
+            let out = render(&app, width, 6);
+            let header = out.lines().next().unwrap();
+            assert!(
+                header.contains("[stale]"),
+                "at {width} columns the stale warning was lost:\n{header}"
+            );
+            assert!(
+                header.contains("staged"),
+                "at {width} columns the staged marker was lost:\n{header}"
+            );
+            assert_eq!(
+                header.chars().count(),
+                width as usize,
+                "at {width} columns the header overflowed"
+            );
+        }
+
+        // Squeezed hard, the path is what gets shortened.
+        let narrow = render(&app, 44, 6);
+        assert!(narrow.lines().next().unwrap().contains('…'), "{narrow}");
+
+        // And the reason sits in the footer, where a keystroke cannot clear it. (A status
+        // message still takes the line while it is showing; it is gone by the next keypress.)
+        app.status = None;
+        let out = render(&app, 100, 6);
+        let footer = out.lines().last().unwrap();
+        assert!(footer.contains("before the commit"), "{footer}");
     }
 
     #[test]

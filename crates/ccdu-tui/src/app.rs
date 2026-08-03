@@ -5,11 +5,16 @@
 //! user is looking at, so everything up to the moment a plan is committed is reversible.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, Outcome};
+use ccdu_core::format::human_size;
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
 use ccdu_core::plan::store::Store;
 use ccdu_core::plan::{validate, Conflict, Finding, Ident, Op, Plan, Severity, ValidateOptions};
+use crossbeam_channel::Receiver;
 
 /// Which column the listing is ordered by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +60,38 @@ impl Graph {
 pub enum View {
     Browse,
     Plan,
+    /// The last chance to back out. Deliberately its own screen rather than a keystroke away from
+    /// the plan, because this is the only irreversible thing ccdu does.
+    Confirm,
+    Running,
+}
+
+/// A commit in progress, or the record of one that finished.
+pub struct Running {
+    control: Arc<Control>,
+    events: Receiver<ExecEvent>,
+    result: Receiver<io::Result<Outcome>>,
+    /// What has happened so far, newest last.
+    pub log: Vec<String>,
+    pub total: usize,
+    pub completed: usize,
+    /// Set once the run ends, whether it finished, paused or failed.
+    pub summary: Option<String>,
+    pub plan_id: String,
+}
+
+impl Running {
+    pub fn is_finished(&self) -> bool {
+        self.summary.is_some()
+    }
+
+    pub fn pause(&self) {
+        self.control.pause();
+    }
+
+    pub fn is_pausing(&self) -> bool {
+        self.control.is_paused() && self.summary.is_none()
+    }
 }
 
 /// A change staged against one entry. Holds the identity read at staging time, which is what the
@@ -103,6 +140,8 @@ pub enum Action {
     Unstage,
     TogglePlan,
     SavePlan,
+    Commit,
+    Confirm,
     Input(char),
     Backspace,
     Submit,
@@ -139,6 +178,9 @@ pub struct App {
     /// Where `w` writes. Injected rather than looked up at save time so tests do not have to
     /// reach for a process-wide environment variable.
     pub store: Store,
+    pub run: Option<Running>,
+    /// Set once a commit has removed things: the tree in memory no longer describes the disk.
+    pub stale: bool,
 
     remembered: HashMap<NodeId, usize>,
 }
@@ -176,6 +218,8 @@ impl App {
             findings: Vec::new(),
             plan_cursor: 0,
             store: Store::open_default(),
+            run: None,
+            stale: false,
             remembered: HashMap::new(),
         };
         app.rebuild_rows();
@@ -273,9 +317,11 @@ impl App {
             }
             return;
         }
-        if self.view == View::Plan {
-            self.plan_key(action);
-            return;
+        match self.view {
+            View::Plan => return self.plan_key(action),
+            View::Confirm => return self.confirm_key(action),
+            View::Running => return self.running_key(action),
+            View::Browse => {}
         }
 
         match action {
@@ -324,7 +370,14 @@ impl App {
                 self.save_plan();
             }
             Action::Quit => self.quit = true,
-            Action::Input(_) | Action::Backspace | Action::Submit | Action::Dismiss => {}
+            // Committing is reached through the plan view, never straight from the browser: the
+            // review screen is the safety, so it is not optional.
+            Action::Commit => self.open_plan(),
+            Action::Confirm
+            | Action::Input(_)
+            | Action::Backspace
+            | Action::Submit
+            | Action::Dismiss => {}
         }
     }
 
@@ -531,10 +584,162 @@ impl App {
                 }
             }
             Action::SavePlan => self.save_plan(),
+            Action::Commit => self.ask_to_commit(),
             Action::ToggleHelp => self.show_help = true,
             Action::TogglePlan | Action::Dismiss | Action::Leave => self.view = View::Browse,
             Action::Quit => self.view = View::Browse,
             _ => {}
+        }
+    }
+
+    /// Move to the confirmation screen, unless validation says the plan cannot run.
+    fn ask_to_commit(&mut self) {
+        self.refresh_plan();
+        if self.plan.ops.is_empty() {
+            self.status = Some("nothing staged".to_string());
+            return;
+        }
+        let errors = self.findings.iter().filter(|f| f.severity == Severity::Error).count();
+        if errors > 0 {
+            self.status =
+                Some(format!("{errors} error{} to resolve before committing", plural(errors)));
+            return;
+        }
+        self.view = View::Confirm;
+    }
+
+    fn confirm_key(&mut self, action: Action) {
+        match action {
+            Action::Confirm => self.start_commit(),
+            Action::Dismiss | Action::Quit | Action::TogglePlan | Action::Leave => {
+                self.view = View::Plan;
+                self.status = Some("not committed".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Save the plan, then run it on a background thread.
+    ///
+    /// Saving first is not a convenience: if this process dies during the commit, the plan and its
+    /// journal are what make the run resumable, and a plan that only existed in memory would take
+    /// the record of what was half-done with it.
+    fn start_commit(&mut self) {
+        let mut plan = self.plan.clone();
+        plan.normalize();
+
+        let dir = match self.store.save(&plan) {
+            Ok(path) => path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+            Err(e) => {
+                self.status = Some(format!("could not save the plan: {e}"));
+                self.view = View::Plan;
+                return;
+            }
+        };
+
+        let control = Arc::new(Control::new());
+        let (event_tx, events) = crossbeam_channel::unbounded();
+        let (result_tx, result) = crossbeam_channel::bounded(1);
+
+        let total = plan.ops.len();
+        let plan_id = plan.id.clone();
+        let worker_control = Arc::clone(&control);
+        std::thread::spawn(move || {
+            let outcome = exec::execute(
+                &plan,
+                &dir,
+                &ExecOptions::default(),
+                &worker_control,
+                Some(&event_tx),
+            );
+            drop(event_tx);
+            result_tx.send(outcome).ok();
+        });
+
+        self.run = Some(Running {
+            control,
+            events,
+            result,
+            log: Vec::new(),
+            total,
+            completed: 0,
+            summary: None,
+            plan_id,
+        });
+        self.view = View::Running;
+        self.status = None;
+    }
+
+    fn running_key(&mut self, action: Action) {
+        let Some(run) = self.run.as_mut() else {
+            self.view = View::Browse;
+            return;
+        };
+        match action {
+            // Pausing mid-commit is the same mechanism recovery uses, so it is always safe.
+            Action::TogglePlan | Action::Input('p') if !run.is_finished() => run.pause(),
+            Action::Dismiss | Action::Quit | Action::Leave if run.is_finished() => {
+                self.view = View::Browse;
+            }
+            Action::ToggleHelp => self.show_help = true,
+            _ => {}
+        }
+    }
+
+    /// Drain whatever the commit thread has reported. Called once per frame.
+    pub fn poll_run(&mut self) {
+        let Some(run) = self.run.as_mut() else { return };
+        if run.is_finished() {
+            return;
+        }
+
+        for event in run.events.try_iter() {
+            match event {
+                ExecEvent::Started { index, summary } => {
+                    run.log.push(format!("#{index} {summary}"))
+                }
+                ExecEvent::Finished { index, freed } => {
+                    run.completed += 1;
+                    run.log.push(format!("#{index} done, {} reclaimed", human_size(freed)));
+                }
+                ExecEvent::Failed { index, error } => {
+                    run.completed += 1;
+                    run.log.push(format!("#{index} FAILED: {error}"));
+                }
+                ExecEvent::AlreadyDone { index } => {
+                    run.completed += 1;
+                    run.log.push(format!("#{index} already done"));
+                }
+            }
+        }
+
+        if let Ok(outcome) = run.result.try_recv() {
+            run.summary = Some(match outcome {
+                Ok(o) if o.paused => format!(
+                    "paused after {} operations, {} reclaimed — resume with `ccdu resume {}`",
+                    o.done,
+                    human_size(o.freed),
+                    run.plan_id
+                ),
+                Ok(o) if o.failed > 0 => format!(
+                    "{} done, {} failed, {} reclaimed",
+                    o.done,
+                    o.failed,
+                    human_size(o.freed)
+                ),
+                Ok(o) => format!("{} operations done, {} reclaimed", o.done, human_size(o.freed)),
+                Err(e) => format!("could not run: {e}"),
+            });
+            // Whatever happened, entries are gone and the tree in memory is a description of a
+            // disk that no longer exists. Say so rather than show numbers that are quietly wrong.
+            // The header carries a terse [stale]; the reason goes here, where there is room.
+            self.stale = true;
+            self.status = Some(
+                "files were removed — the listing is from before the commit; rerun ccdu to rescan"
+                    .to_string(),
+            );
+            self.staged.clear();
+            self.marks.clear();
         }
     }
 
@@ -839,6 +1044,118 @@ mod tests {
         assert_eq!(app.plan.ops.len(), 2);
         assert!(!app.has_errors(), "{:?}", app.findings);
         assert!(app.findings.iter().any(|f| f.message.contains("redundant")), "{:?}", app.findings);
+    }
+
+    /// Drive a commit to completion, polling the way the event loop does.
+    fn commit_and_wait(app: &mut App) {
+        app.apply(Action::Commit);
+        assert_eq!(app.view, View::Confirm, "commit should stop at a confirmation");
+        app.apply(Action::Confirm);
+        assert_eq!(app.view, View::Running);
+
+        for _ in 0..2000 {
+            app.poll_run();
+            if app.run.as_ref().is_some_and(|r| r.is_finished()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("commit never finished");
+    }
+
+    #[test]
+    fn committing_deletes_what_was_staged_and_nothing_else() {
+        let (dir, mut app) = fixture();
+        app.store = Store::at(dir.path().join("state-commit"));
+
+        app.apply(Action::StageDelete); // "big/"
+        app.apply(Action::TogglePlan);
+        commit_and_wait(&mut app);
+
+        let run = app.run.as_ref().unwrap();
+        assert!(
+            run.summary.as_deref().unwrap().contains("1 operations done"),
+            "{run:?}",
+            run = run.summary
+        );
+        assert!(!dir.path().join("big").exists(), "the staged directory survived");
+        assert!(dir.path().join("small/one").exists(), "something unstaged was deleted");
+        assert!(dir.path().join("tiny").exists());
+    }
+
+    #[test]
+    fn a_commit_leaves_a_resumable_plan_behind() {
+        let (dir, mut app) = fixture();
+        app.store = Store::at(dir.path().join("state-record"));
+
+        app.apply(Action::StageDelete);
+        app.apply(Action::TogglePlan);
+        commit_and_wait(&mut app);
+
+        // The plan and its journal outlive the run, which is what makes a crash recoverable.
+        let listed = app.store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        let plan_dir = app.store.dir_for(&listed[0].id).unwrap();
+        assert_eq!(ccdu_core::exec::state(&plan_dir).unwrap(), ccdu_core::exec::RunState::Finished);
+    }
+
+    #[test]
+    fn backing_out_of_the_confirmation_changes_nothing() {
+        let (dir, mut app) = fixture();
+        app.store = Store::at(dir.path().join("state-cancel"));
+
+        app.apply(Action::StageDelete);
+        app.apply(Action::TogglePlan);
+        app.apply(Action::Commit);
+        assert_eq!(app.view, View::Confirm);
+
+        app.apply(Action::Dismiss);
+        assert_eq!(app.view, View::Plan);
+        assert!(dir.path().join("big").exists(), "backing out still deleted something");
+        assert!(app.run.is_none());
+        assert_eq!(app.staged.len(), 1, "backing out should not unstage anything");
+    }
+
+    #[test]
+    fn a_plan_with_errors_cannot_be_committed() {
+        let (dir, mut app) = fixture();
+        app.store = Store::at(dir.path().join("state-blocked"));
+
+        app.apply(Action::StageMove);
+        type_in(&mut app, "/");
+        app.apply(Action::Submit);
+        app.apply(Action::TogglePlan);
+        app.apply(Action::Commit);
+
+        assert_eq!(app.view, View::Plan, "a plan with errors reached the confirmation screen");
+        assert!(app.status.as_deref().unwrap_or("").contains("to resolve"), "{:?}", app.status);
+    }
+
+    #[test]
+    fn committing_marks_the_tree_stale() {
+        let (dir, mut app) = fixture();
+        app.store = Store::at(dir.path().join("state-stale"));
+        assert!(!app.stale);
+
+        app.apply(Action::StageDelete);
+        app.apply(Action::TogglePlan);
+        commit_and_wait(&mut app);
+
+        // The sizes in memory now describe a disk that no longer exists.
+        assert!(app.stale, "the browser would keep showing totals for deleted files");
+        assert!(app.staged.is_empty(), "staging survived the commit that consumed it");
+    }
+
+    #[test]
+    fn committing_is_only_reachable_through_the_review_screen() {
+        let (dir, mut app) = fixture();
+        app.store = Store::at(dir.path().join("state-route"));
+        app.apply(Action::StageDelete);
+
+        // `c` from the browser opens the plan rather than the confirmation.
+        app.apply(Action::Commit);
+        assert_eq!(app.view, View::Plan);
+        assert!(dir.path().join("big").exists());
     }
 
     #[test]
