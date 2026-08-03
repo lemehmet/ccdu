@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use ccdu_core::config::Config;
 use ccdu_core::dup::{self, DupGroup, DupOptions, DupProgress};
 use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, Outcome};
 use ccdu_core::format::human_size;
@@ -238,6 +239,9 @@ pub struct App {
     /// like, and committing runs there — the plan and its journal live where the files do, so an
     /// interrupted commit is resumable on the machine that was doing the work.
     pub remote: Option<Arc<Mutex<Remote>>>,
+    /// Paths the user has put out of reach, built-in list plus their own.
+    protected: Vec<PathBuf>,
+    headroom: f64,
 
     remembered: HashMap<NodeId, usize>,
 }
@@ -267,6 +271,11 @@ fn plural(n: usize) -> &'static str {
 
 impl App {
     pub fn new(tree: Tree) -> Self {
+        App::with_config(tree, Config::load().unwrap_or_default())
+    }
+
+    /// Build with an explicit configuration, so tests need not touch the user's.
+    pub fn with_config(tree: Tree, config: Config) -> Self {
         let root = tree.root_path().to_path_buf();
         let mut app = App {
             // Shared so a duplicate scan can read it from another thread while the browser keeps
@@ -277,7 +286,7 @@ impl App {
             rows: Vec::new(),
             sort: Sort::Size,
             reverse: false,
-            apparent: false,
+            apparent: config.scan.apparent,
             graph: Graph::Both,
             show_help: false,
             show_info: false,
@@ -294,10 +303,12 @@ impl App {
             store: Store::open_default(),
             run: None,
             stale: false,
-            show_treemap: false,
+            show_treemap: config.scan.treemap,
             dupes: None,
             read_only: None,
             remote: None,
+            protected: config.protected(),
+            headroom: config.safety.headroom,
             remembered: HashMap::new(),
         };
         app.rebuild_rows();
@@ -803,7 +814,14 @@ impl App {
             })
             .collect();
 
-        self.findings = validate(&plan, &ValidateOptions::default());
+        self.findings = validate(
+            &plan,
+            &ValidateOptions {
+                protected: self.protected.clone(),
+                headroom: self.headroom,
+                ..Default::default()
+            },
+        );
         self.plan = plan;
     }
 

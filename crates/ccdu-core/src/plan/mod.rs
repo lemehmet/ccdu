@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Kind;
 
-pub use validate::{validate, Finding, Severity, ValidateOptions};
+pub use validate::{default_protected, validate, Finding, Severity, ValidateOptions};
 
 /// Bumped when the on-disk format changes incompatibly. A plan from the future is refused rather
 /// than half-understood.

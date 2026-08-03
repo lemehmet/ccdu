@@ -174,6 +174,39 @@ the original.
 `--verify=hash` re-reads both sides and compares blake3 digests; the default checks lengths, which
 is what an interrupted copy gets wrong.
 
+## Configuration
+
+Optional. Everything has a working default, and an empty file behaves exactly like no file.
+
+```sh
+ccdu config           # where it is read from, and what it currently says
+ccdu config --write   # a commented file with every option at its default
+```
+
+```toml
+[scan]
+exclude = [".git", "node_modules"]
+one_file_system = true
+
+[safety]
+# Never operated on, on top of the built-in system list. Matched exactly:
+# the directory itself is refused, its contents are not.
+protect = ["/srv/archive", "/home/me/photos"]
+```
+
+A file that does not parse is an error rather than a silent fallback — a typo in `protect` would
+otherwise leave a directory unprotected while the user believed it was safe:
+
+```
+Error: loading configuration
+
+Caused by:
+    ~/.config/ccdu/config.toml: TOML parse error at line 2, column 1
+    unknown field `protekt`, expected one of `protect`, `no_default_protection`, `headroom`
+```
+
+`CCDU_CONFIG` overrides the location.
+
 ## Running the tests
 
 ```sh

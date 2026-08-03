@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use ccdu_core::config::Config;
 use ccdu_core::dup::{find_duplicates, shares_inode, total_wasted, DupOptions};
 use ccdu_core::exec::journal::Event;
 use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, FaultFn, FaultPoint, Verify};
@@ -73,6 +74,13 @@ enum Command {
 
     /// Report how far a plan's execution got.
     Status { id: String },
+
+    /// Show where configuration is read from, and what it currently says.
+    Config {
+        /// Write a commented file with every option at its default. Refuses to overwrite.
+        #[arg(long)]
+        write: bool,
+    },
 
     /// Report files with identical contents. `--top` limits how many groups are listed.
     Dupes {
@@ -198,6 +206,7 @@ fn main() -> Result<()> {
         Some(Command::Resume { id }) => apply(&id, false, true, false, Verify::Size, true),
         Some(Command::Status { id }) => status(&id),
         Some(Command::Dupes { scan, min_size }) => dupes(scan, min_size),
+        Some(Command::Config { write }) => config_command(write),
         None => browse(cli.scan),
     }
 }
@@ -313,8 +322,7 @@ fn apply(
     let plan = store.load(id).with_context(|| format!("loading plan {id}"))?;
     let dir = store.dir_for(id)?;
 
-    let opts = ValidateOptions { allow_outside_root: allow_outside, ..Default::default() };
-    let findings = validate(&plan, &opts);
+    let findings = validate(&plan, &validate_options(allow_outside)?);
     let errors: Vec<_> = findings.iter().filter(|f| f.severity == Severity::Error).collect();
 
     // On a resume the entries we already started have moved on by our own hand, so validation's
@@ -498,8 +506,7 @@ fn plan_command(cmd: PlanCmd) -> Result<()> {
 
         PlanCmd::Validate { id, allow_outside } => {
             let plan = store.load(&id).with_context(|| format!("loading plan {id}"))?;
-            let opts = ValidateOptions { allow_outside_root: allow_outside, ..Default::default() };
-            let findings = validate(&plan, &opts);
+            let findings = validate(&plan, &validate_options(allow_outside)?);
 
             let errors = findings.iter().filter(|f| f.severity == Severity::Error).count();
             for f in &findings {
@@ -525,6 +532,43 @@ fn plan_command(cmd: PlanCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn config_command(write: bool) -> Result<()> {
+    let Some(path) = Config::path() else {
+        anyhow::bail!("no home directory, so no configuration file");
+    };
+
+    if write {
+        if path.exists() {
+            anyhow::bail!("{} already exists; edit it rather than overwrite it", path.display());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, Config::example())?;
+        println!("wrote {}", path.display());
+        return Ok(());
+    }
+
+    let config = Config::load().context("loading configuration")?;
+    println!("file       {}{}", path.display(), if path.exists() { "" } else { " (absent)" });
+    println!("threads    {}", config.scan.threads.map(|n| n.to_string()).unwrap_or("auto".into()));
+    println!(
+        "exclude    {}",
+        if config.scan.exclude.is_empty() {
+            "(none)".to_string()
+        } else {
+            config.scan.exclude.join(", ")
+        }
+    );
+    println!("one fs     {}", config.scan.one_file_system);
+    println!("headroom   {}%", (config.safety.headroom * 100.0).round());
+    println!("protected  {} paths", config.protected().len());
+    for extra in &config.safety.protect {
+        println!("           {} (yours)", extra.display());
+    }
+    Ok(())
 }
 
 /// Open a connection and scan through it, keeping the connection for staging and committing.
@@ -616,18 +660,36 @@ fn load(file: &std::path::Path) -> Result<ccdu_core::model::Tree> {
 
 /// Resolve the scan root and turn command line flags into scan options.
 fn prepare(args: &ScanArgs) -> Result<(PathBuf, ScanOptions)> {
+    let config = Config::load().context("loading configuration")?;
     let path = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
     let path = path.canonicalize().with_context(|| format!("cannot access {}", path.display()))?;
 
+    // Command line first, then the file, then the built-in default: the narrower the scope, the
+    // higher it wins.
+    let mut excludes: Vec<Vec<u8>> =
+        config.scan.exclude.iter().map(|e| e.as_bytes().to_vec()).collect();
+    excludes.extend(args.excludes.iter().map(|e| e.as_bytes().to_vec()));
+
     let mut opts = ScanOptions {
-        one_file_system: args.one_file_system,
-        exclude_names: args.excludes.iter().map(|e| e.as_bytes().to_vec()).collect(),
+        one_file_system: args.one_file_system || config.scan.one_file_system,
+        exclude_names: excludes,
         ..Default::default()
     };
-    if let Some(threads) = args.threads {
+    if let Some(threads) = args.threads.or(config.scan.threads) {
         opts.threads = threads.max(1);
     }
     Ok((path, opts))
+}
+
+/// Validation settings, with the user's protected paths folded in.
+fn validate_options(allow_outside: bool) -> Result<ValidateOptions> {
+    let config = Config::load().context("loading configuration")?;
+    Ok(ValidateOptions {
+        allow_outside_root: allow_outside,
+        protected: config.protected(),
+        headroom: config.safety.headroom,
+        ..Default::default()
+    })
 }
 
 /// Headless mode: scan and print a summary, for scripts and for machines without a usable
