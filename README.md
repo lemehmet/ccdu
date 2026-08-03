@@ -215,7 +215,13 @@ CCDU_TEST_OTHER_FS=/dev/shm/ccdu-tests cargo test   # also exercises cross-files
 ```
 
 The cross-filesystem tests need a directory on a second filesystem. Without one they print that
-they were skipped rather than passing vacuously.
+they were skipped rather than passing vacuously — so CI provides one on both platforms and fails
+if it turns out not to be a second filesystem after all.
+
+CI runs fmt, clippy and the tests on Linux and macOS, and builds the workspace at the declared
+minimum Rust version. Releases are built natively on each platform rather than cross-compiled:
+ccdu is a program made almost entirely of syscalls, and the binary that ships should be the one
+the tests ran against.
 
 Sizes are `st_blocks * 512` (what freeing the file actually returns) unless you press `a`, and
 hardlinked files are counted once. `ccdu` matches `du -s --block-size=1` on the trees it has been

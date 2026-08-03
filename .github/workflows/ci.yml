@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are errors in CI and not locally: the point is to keep them out of main without
+  # interrupting somebody mid-thought.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The cross-filesystem move tests skip themselves without a second filesystem, so CI
+      # provides one rather than quietly covering less than it looks like.
+      - name: Second filesystem (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p /dev/shm/ccdu-test
+          echo "CCDU_TEST_OTHER_FS=/dev/shm/ccdu-test" >> "$GITHUB_ENV"
+
+      - name: Second filesystem (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create -size 200m -fs APFS -volname ccdu-test -o /tmp/ccdu-test.dmg
+          hdiutil attach /tmp/ccdu-test.dmg -mountpoint /tmp/ccdu-other
+          echo "CCDU_TEST_OTHER_FS=/tmp/ccdu-other" >> "$GITHUB_ENV"
+
+      # Asked directly rather than through `stat`, whose flags and output differ between the two
+      # platforms in ways that made an earlier version of this check pass when it should fail.
+      - name: Confirm it really is a second filesystem
+        run: |
+          python3 - <<'EOF'
+          import os, sys
+          other = os.environ["CCDU_TEST_OTHER_FS"]
+          here, there = os.stat(".").st_dev, os.stat(other).st_dev
+          print(f"checkout dev={here}, {other} dev={there}")
+          if here == there:
+              print(f"::error::{other} is on the same filesystem as the checkout")
+              sys.exit(1)
+          EOF
+
+      - run: cargo build --all-targets
+      - run: cargo test --all-features
+
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from the workspace
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Build only: the declared minimum has to compile the program, not the test suite's
+      # dependencies, which move faster than we want to track.
+      - run: cargo build --workspace

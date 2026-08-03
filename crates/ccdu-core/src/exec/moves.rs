@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
-    fchmod, fchown, fsync, ftruncate, futimens, linkat, mkdirat, mkfifoat, openat, readlinkat,
+    fchmod, fchown, fsync, ftruncate, futimens, linkat, mkdirat, openat, readlinkat,
     renameat, seek, statat, symlinkat, unlinkat, AtFlags, Dir, FileType, Gid, Mode, OFlags,
     SeekFrom, Stat, Timestamps, Uid, CWD,
 };
@@ -382,8 +382,7 @@ fn copy_tree(
                 None
             }
             EntryKind::Other => {
-                if FileType::from_raw_mode(stat.st_mode as _) == FileType::Fifo {
-                    mkfifoat(&top.dst, name.as_c_str(), mode_of(&stat)).ok();
+                if recreate_fifo(&top.dst, name.as_c_str(), &stat) {
                     None
                 } else {
                     // Sockets and device nodes cannot be honestly reproduced, and a move that
@@ -646,6 +645,26 @@ fn link_to(existing: &Path, dst_dir: &OwnedFd, name: &CStr) -> Result<(), OpErro
         Ok(()) | Err(Errno::EXIST) => Ok(()),
         Err(e) => Err(io::Error::other(format!("linking {name:?}: {}", errno(e))).into()),
     }
+}
+
+/// Recreate a named pipe beside its original, where the platform offers a way to do it relative
+/// to a directory descriptor.
+///
+/// macOS has no `mkfifoat`, and reconstructing the full path mid-copy would reintroduce exactly
+/// the path-resolution race the rest of this module avoids. A pipe carries no data, but a move
+/// that silently dropped one and then deleted the original would still be a move that lost
+/// something, so the caller refuses instead.
+#[cfg(target_os = "linux")]
+fn recreate_fifo(parent: &OwnedFd, name: &CStr, stat: &Stat) -> bool {
+    if FileType::from_raw_mode(stat.st_mode as _) != FileType::Fifo {
+        return false;
+    }
+    rustix::fs::mkfifoat(parent, name, mode_of(stat)).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recreate_fifo(_parent: &OwnedFd, _name: &CStr, _stat: &Stat) -> bool {
+    false
 }
 
 fn ensure_dir(parent: &OwnedFd, name: &CStr, mode: Mode) -> Result<OwnedFd, OpError> {
