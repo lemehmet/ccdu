@@ -2,9 +2,12 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use ccdu_core::exec::journal::Event;
+use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, FaultFn, FaultPoint};
 use ccdu_core::format::{format_time, human_size};
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
 use ccdu_core::plan::store::Store;
@@ -37,6 +40,26 @@ enum Command {
         #[command(subcommand)]
         cmd: PlanCmd,
     },
+
+    /// Run a saved plan.
+    Apply {
+        id: String,
+        /// Check everything and report what would happen, without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Permit operations on paths outside the scanned tree.
+        #[arg(long)]
+        allow_outside: bool,
+    },
+
+    /// Continue a plan that was paused or interrupted.
+    Resume { id: String },
+
+    /// Report how far a plan's execution got.
+    Status { id: String },
 }
 
 #[derive(Subcommand)]
@@ -89,8 +112,210 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Scan(args)) => report(args),
         Some(Command::Plan { cmd }) => plan_command(cmd),
+        Some(Command::Apply { id, dry_run, yes, allow_outside }) => {
+            apply(&id, dry_run, yes, allow_outside, false)
+        }
+        Some(Command::Resume { id }) => apply(&id, false, true, false, true),
+        Some(Command::Status { id }) => status(&id),
         None => browse(cli.scan),
     }
+}
+
+/// Set by the signal handler; polled by a watcher thread that pauses the run.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_interrupt(_: libc::c_int) {
+    // Async-signal-safe: a relaxed store and nothing else.
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+fn status(id: &str) -> Result<()> {
+    let store = Store::open_default();
+    let plan = store.load(id).with_context(|| format!("loading plan {id}"))?;
+    let dir = store.dir_for(id)?;
+
+    let state = exec::state(&dir)?;
+    println!("plan   {}", plan.id);
+    println!("root   {}", plan.root.display());
+    println!("state  {}", describe(state));
+
+    let records = exec::journal::read_dir(&dir)?;
+    let done = records.iter().filter(|r| matches!(r.event, Event::OpDone { .. })).count();
+    let failed = records.iter().filter(|r| matches!(r.event, Event::OpFailed { .. })).count();
+    let freed: u64 = records
+        .iter()
+        .filter_map(|r| match r.event {
+            Event::OpDone { freed, .. } => Some(freed),
+            _ => None,
+        })
+        .sum();
+
+    println!("done   {done} of {} operations, {} reclaimed", plan.ops.len(), human_size(freed));
+    if failed > 0 {
+        println!("failed {failed}");
+        for record in &records {
+            if let Event::OpFailed { op, error } = &record.event {
+                println!("       #{op}  {error}");
+            }
+        }
+    }
+    if state == exec::RunState::Paused || state == exec::RunState::Interrupted {
+        println!("\nrun `ccdu resume {}` to continue", plan.id);
+    }
+    Ok(())
+}
+
+fn describe(state: exec::RunState) -> &'static str {
+    match state {
+        exec::RunState::NotStarted => "not started",
+        exec::RunState::Interrupted => "interrupted (crashed or killed)",
+        exec::RunState::Paused => "paused",
+        exec::RunState::Finished => "finished",
+    }
+}
+
+fn apply(id: &str, dry_run: bool, yes: bool, allow_outside: bool, resuming: bool) -> Result<()> {
+    let store = Store::open_default();
+    let plan = store.load(id).with_context(|| format!("loading plan {id}"))?;
+    let dir = store.dir_for(id)?;
+
+    let opts = ValidateOptions { allow_outside_root: allow_outside, ..Default::default() };
+    let findings = validate(&plan, &opts);
+    let errors: Vec<_> = findings.iter().filter(|f| f.severity == Severity::Error).collect();
+
+    // On a resume the entries we already started have moved on by our own hand, so validation's
+    // view of them is stale. The executor re-checks each one against the journal, which knows
+    // which were in flight; that check is the authority, not this one.
+    if !errors.is_empty() && !resuming {
+        for f in &errors {
+            match f.op {
+                Some(i) => eprintln!("error  #{i}  {}", f.message),
+                None => eprintln!("error       {}", f.message),
+            }
+        }
+        anyhow::bail!("{} problem(s) block this plan; nothing was changed", errors.len());
+    }
+    for f in findings.iter().filter(|f| f.severity == Severity::Warning) {
+        match f.op {
+            Some(i) => eprintln!("warn   #{i}  {}", f.message),
+            None => eprintln!("warn        {}", f.message),
+        }
+    }
+
+    if !yes && !dry_run && !confirm(&plan)? {
+        println!("cancelled; nothing was changed");
+        return Ok(());
+    }
+
+    // SIGINT pauses rather than kills, so Ctrl-C leaves a resumable run instead of an ambiguous
+    // one. A second Ctrl-C still terminates, because the handler is not reinstalled.
+    unsafe {
+        libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_interrupt as *const () as libc::sighandler_t);
+    }
+
+    let control = Control::new();
+    let finished = AtomicBool::new(false);
+    let (tx, rx) = crossbeam_channel::unbounded::<ExecEvent>();
+    let fault = fault_from_env();
+
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !finished.load(Ordering::Relaxed) {
+                if INTERRUPTED.load(Ordering::Relaxed) {
+                    eprintln!("\npausing; run `ccdu resume {}` to continue", plan.id);
+                    control.pause();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        scope.spawn(move || {
+            for event in rx {
+                match event {
+                    ExecEvent::Started { index, summary } => println!("  #{index}  {summary}"),
+                    ExecEvent::Finished { index, freed } => {
+                        println!("  #{index}  done, {} reclaimed", human_size(freed))
+                    }
+                    ExecEvent::Failed { index, error } => eprintln!("  #{index}  failed: {error}"),
+                    ExecEvent::AlreadyDone { index } => println!("  #{index}  already done"),
+                }
+            }
+        });
+
+        let exec_opts = ExecOptions { dry_run, fault: fault.as_ref().map(|f| f.as_ref()) };
+        let result = exec::execute(&plan, &dir, &exec_opts, &control, Some(&tx));
+        drop(tx);
+        finished.store(true, Ordering::Relaxed);
+        result
+    })?;
+
+    println!();
+    if dry_run {
+        println!(
+            "dry run: {} operations would run, {} would be reclaimed",
+            outcome.done,
+            human_size(outcome.freed)
+        );
+    } else if outcome.paused {
+        println!(
+            "paused after {} operations, {} reclaimed; resume with `ccdu resume {}`",
+            outcome.done,
+            human_size(outcome.freed),
+            plan.id
+        );
+    } else {
+        println!("{} operations done, {} reclaimed", outcome.done, human_size(outcome.freed));
+    }
+    if outcome.failed > 0 {
+        println!("{} failed; see `ccdu status {}`", outcome.failed, plan.id);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn confirm(plan: &ccdu_core::plan::Plan) -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("refusing to run unattended without --yes");
+    }
+    println!(
+        "About to run {} operations under {}, reclaiming about {}.",
+        plan.ops.len(),
+        plan.root.display(),
+        human_size(plan.delete_bytes())
+    );
+    println!("This cannot be undone.");
+    print!("Continue? [y/N] ");
+    std::io::stdout().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
+/// Testing aid: `CCDU_FAULT=<point>:<op>` aborts the process at that journal boundary, so the
+/// crash-recovery path can be exercised against a real killed process rather than a simulated one.
+fn fault_from_env() -> Option<Box<FaultFn<'static>>> {
+    let spec = std::env::var("CCDU_FAULT").ok()?;
+    let (name, index) = spec.split_once(':')?;
+    let target: usize = index.parse().ok()?;
+    let point = match name {
+        "before_op_begin" => FaultPoint::BeforeOpBegin,
+        "after_op_begin" => FaultPoint::AfterOpBegin,
+        "mid_delete" => FaultPoint::MidDelete,
+        "before_op_done" => FaultPoint::BeforeOpDone,
+        "after_op_done" => FaultPoint::AfterOpDone,
+        _ => return None,
+    };
+    Some(Box::new(move |p, op| {
+        if p == point && op == target {
+            // Not a panic: this has to look like the machine going away, with no unwinding and no
+            // chance to flush anything.
+            std::process::abort();
+        }
+        Ok(())
+    }))
 }
 
 fn plan_command(cmd: PlanCmd) -> Result<()> {

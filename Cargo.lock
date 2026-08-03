@@ -175,6 +175,8 @@ dependencies = [
  "ccdu-tui",
  "clap",
  "crossbeam-channel",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

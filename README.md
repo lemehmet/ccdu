@@ -15,7 +15,7 @@ Early development. See the milestone table below.
 | M1 | Scanner, arena tree, hardlink accounting | done |
 | M2 | TUI browser | done |
 | M3 | Staging, plan persistence, validation | done |
-| M4 | Executor: deletes, journal, pause/resume | |
+| M4 | Executor: deletes, journal, pause/resume | done |
 | M5 | Moves: same-fs, reflink, cross-device | |
 | M6 | Treemap panel, duplicate detection | |
 | M7 | ncdu import/export, SSH agent | |
@@ -77,7 +77,42 @@ most — any entry whose identity no longer matches what was staged:
 error  #0  changed since staging: modified at 2026-08-03 20:29:54 (was 2026-08-03 20:29:51)
 ```
 
-Executing a plan lands in M4; today `ccdu` only ever reads your files.
+## Committing
+
+```sh
+ccdu apply <id> --dry-run    # check everything, change nothing, journal nothing
+ccdu apply <id>              # asks for confirmation first
+ccdu resume <id>             # continue a paused or interrupted run
+ccdu status <id>             # how far it got
+```
+
+Ctrl-C **pauses** rather than kills, leaving a run you can resume instead of a state you have to
+work out. So does a crash — the two are the same thing to the recovery path:
+
+```
+$ ccdu apply 20260803T212000-cafe0002 --yes
+  #0  delete /data/bulk
+^C
+pausing; run `ccdu resume 20260803T212000-cafe0002` to continue
+paused after 0 operations, 67.0 MiB reclaimed
+
+$ ccdu resume 20260803T212000-cafe0002
+  #0  delete /data/bulk
+  #0  done, 50.9 MiB reclaimed
+
+1 operations done, 117.9 MiB reclaimed
+```
+
+The total covers both attempts, because the resumed run can only measure what was left to remove.
+
+Every record reaches disk before the syscall it describes, so the journal can claim work that never
+happened but can never omit work that did — and since each operation re-checks reality and is
+idempotent, a premature claim costs one wasted check rather than a file. Deletion runs through
+`*at` syscalls on a directory descriptor the executor opened itself, so a path swapped mid-run
+cannot redirect it, and an unwritable directory is detected before its contents are gone rather
+than after.
+
+Moves are refused until M5, as a whole plan rather than half way through one.
 
 Sizes are `st_blocks * 512` (what freeing the file actually returns) unless you press `a`, and
 hardlinked files are counted once. `ccdu` matches `du -s --block-size=1` on the trees it has been
