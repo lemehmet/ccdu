@@ -16,7 +16,7 @@ Early development. See the milestone table below.
 | M2 | TUI browser | done |
 | M3 | Staging, plan persistence, validation | done |
 | M4 | Executor: deletes, journal, pause/resume | done |
-| M5 | Moves: same-fs, reflink, cross-device | |
+| M5 | Moves: same-fs, reflink, cross-device | done |
 | M6 | Treemap panel, duplicate detection | |
 | M7 | ncdu import/export, SSH agent | |
 
@@ -118,7 +118,41 @@ commit running in the TUI can be paused with `p` and continued later with `ccdu 
 has run, the listing describes a disk that no longer exists, and says so rather than showing
 numbers that are quietly wrong.
 
-Moves are refused until M5, as a whole plan rather than half way through one.
+## Moving
+
+Three paths, cheapest first:
+
+| | |
+|---|---|
+| **Rename** | Same filesystem: one syscall, atomic, consumes nothing |
+| **Reflink** | Different `st_dev`, same filesystem — btrfs subvolumes, where `rename` gives `EXDEV` but the data can still be shared rather than duplicated |
+| **Copy, verify, unlink** | Different filesystems. In that order, always |
+
+The source is the only copy of the data until the destination is durable and checked, so it is the
+last thing to go. A cross-filesystem move assembles the destination under `.ccdu-part-<n>-<name>`
+and renames it into place only once complete, so a half-copied tree never appears at the
+destination path and an interrupted move resumes into the same temporary instead of starting over.
+A file already there at the right length is skipped; a short one is a torn copy and is redone
+rather than trusted.
+
+Copies preserve permissions, timestamps, ownership where privileged, symlinks (recreated, not
+followed), and holes — a 64 MiB sparse file arrives sparse. Files hardlinked to each other inside
+the tree arrive as one inode with two names rather than two copies. A socket or device node is
+refused outright: ccdu will not claim to have copied something it cannot reproduce and then delete
+the original.
+
+`--verify=hash` re-reads both sides and compares blake3 digests; the default checks lengths, which
+is what an interrupted copy gets wrong.
+
+## Running the tests
+
+```sh
+cargo test
+CCDU_TEST_OTHER_FS=/dev/shm/ccdu-tests cargo test   # also exercises cross-filesystem moves
+```
+
+The cross-filesystem tests need a directory on a second filesystem. Without one they print that
+they were skipped rather than passing vacuously.
 
 Sizes are `st_blocks * 512` (what freeing the file actually returns) unless you press `a`, and
 hardlinked files are counted once. `ccdu` matches `du -s --block-size=1` on the trees it has been

@@ -11,6 +11,7 @@
 //!    tree, so a commit can be interrupted without waiting for it to finish.
 
 pub mod journal;
+pub mod moves;
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
@@ -27,6 +28,7 @@ use rustix::io::Errno;
 
 use crate::plan::{EntryKind, Ident, Op, Plan};
 use journal::{Event, Journal};
+pub use moves::Verify;
 
 const DIR_FLAGS: OFlags =
     OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
@@ -65,6 +67,10 @@ pub enum FaultPoint {
     AfterOpBegin,
     /// Part of a tree removed, no completion recorded.
     MidDelete,
+    /// Part of a tree copied, nothing published.
+    MidCopy,
+    /// The copy is published at its destination; the original is still there.
+    BeforeSourceRemoval,
     /// Everything done, completion not yet recorded.
     BeforeOpDone,
     /// Everything done and recorded.
@@ -81,6 +87,8 @@ pub type Fault<'a> = &'a FaultFn<'a>;
 pub struct ExecOptions<'a> {
     /// Check everything, change nothing.
     pub dry_run: bool,
+    /// How hard a copied file is checked before its original is removed.
+    pub verify: Verify,
     pub fault: Option<Fault<'a>>,
 }
 
@@ -198,13 +206,6 @@ pub fn execute(
     control: &Control,
     progress: Option<&Sender<ExecEvent>>,
 ) -> io::Result<Outcome> {
-    if let Some(op) = plan.ops.iter().find(|o| !o.is_delete()) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("moves are not implemented yet: {}", op.summary()),
-        ));
-    }
-
     let (terminal, in_flight, mut totals) = replay(dir)?;
 
     // A dry run writes nothing — not even to the journal. Recording completions for work that did
@@ -284,11 +285,18 @@ fn record(journal: &mut Option<Journal>, event: Event) -> io::Result<()> {
     }
 }
 
-/// Deepest paths first, so a deletion nested inside another runs before the parent sweeps it away
-/// and the freed bytes are attributed to the operation that actually removed them.
+/// Moves before deletions, and within each, deepest paths first.
+///
+/// Moves go first because they preserve data and deletions destroy it: if a run stops half way,
+/// what survives should be everything that was going to be kept. Depth ordering means a deletion
+/// nested inside another runs before the parent sweeps it away, so the freed bytes are attributed
+/// to the operation that actually removed them.
 fn execution_order(plan: &Plan) -> Vec<usize> {
     let mut order: Vec<usize> = (0..plan.ops.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(plan.ops[i].source().components().count()));
+    order.sort_by_key(|&i| {
+        let op = &plan.ops[i];
+        (op.is_delete(), std::cmp::Reverse(op.source().components().count()))
+    });
     order
 }
 
@@ -305,7 +313,7 @@ enum Step {
 
 /// An injected fault is a simulated crash, not an operation that failed: it must propagate out of
 /// the run untouched rather than be recorded as a failure the way a real error would be.
-enum OpError {
+pub(crate) enum OpError {
     Fault(io::Error),
     Failed(io::Error),
 }
@@ -323,8 +331,23 @@ fn run_op(
     control: &Control,
     index: usize,
 ) -> Result<Step, OpError> {
-    let Op::Delete { path, ident, est_bytes } = op else {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "not a deletion").into());
+    let (path, ident, est_bytes) = match op {
+        Op::Delete { path, ident, est_bytes } => (path, ident, est_bytes),
+        Op::Move { src, dst, ident, est_bytes, on_conflict } => {
+            return moves::run_move(
+                &moves::MoveRequest {
+                    src,
+                    dst,
+                    ident,
+                    est_bytes: *est_bytes,
+                    on_conflict: *on_conflict,
+                    strict,
+                    index,
+                },
+                opts,
+                control,
+            )
+        }
     };
 
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
@@ -573,9 +596,27 @@ fn blocks(stat: &rustix::fs::Stat) -> u64 {
     blocks_of(stat)
 }
 
+/// Remove a tree without checking for a pause.
+///
+/// Used once a move has published its copy: at that point the original is redundant, and stopping
+/// half way would leave two copies of the data and an operation that looks unfinished.
+pub(super) fn remove_tree_uninterruptible(
+    parent_fd: &OwnedFd,
+    name: &CStr,
+    blocks: u64,
+) -> Result<u64, OpError> {
+    let opts = ExecOptions::default();
+    let control = Control::new();
+    match remove_tree(parent_fd, name, blocks, &opts, &control, usize::MAX)? {
+        Step::Done(freed) | Step::Paused(freed) => Ok(freed),
+    }
+}
+
 fn errno(e: Errno) -> io::Error {
     io::Error::from_raw_os_error(e.raw_os_error())
 }
 
+#[cfg(test)]
+mod move_tests;
 #[cfg(test)]
 mod tests;

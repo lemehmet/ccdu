@@ -122,7 +122,7 @@ fn resuming_after_a_fault_anywhere_matches_a_clean_run() {
                     Ok(())
                 }
             };
-            let opts = ExecOptions { dry_run: false, fault: Some(&hook) };
+            let opts = ExecOptions { fault: Some(&hook), ..Default::default() };
             let interrupted = execute(&plan, journal_dir.path(), &opts, &Control::new(), None);
 
             // MidDelete never fires for an operation with nothing to unlink first, so the run may
@@ -273,7 +273,7 @@ fn pausing_part_way_through_a_tree_resumes_and_finishes() {
         }
         Ok(())
     };
-    let opts = ExecOptions { dry_run: false, fault: Some(&hook) };
+    let opts = ExecOptions { fault: Some(&hook), ..Default::default() };
     let paused = execute(&plan, journal_dir.path(), &opts, &control, None).unwrap();
 
     assert!(paused.paused);
@@ -330,13 +330,16 @@ fn a_resumed_operation_still_refuses_a_different_inode() {
             Ok(())
         }
     };
-    let opts = ExecOptions { dry_run: false, fault: Some(&hook) };
+    let opts = ExecOptions { fault: Some(&hook), ..Default::default() };
     execute(&plan, journal_dir.path(), &opts, &Control::new(), None).unwrap_err();
 
-    // Somebody replaces the directory entirely while we were down.
+    // Somebody replaces the directory entirely while we were down. The replacement is created
+    // while the original still exists, so it is guaranteed a different inode — recreating at the
+    // same path can reuse the old one, which would make this test agree by accident.
+    fs::create_dir(root.join("replacement")).unwrap();
+    fs::write(root.join("replacement/precious"), vec![0u8; 10]).unwrap();
     fs::remove_dir_all(root.join("target")).unwrap();
-    fs::create_dir(root.join("target")).unwrap();
-    fs::write(root.join("target/precious"), vec![0u8; 10]).unwrap();
+    fs::rename(root.join("replacement"), root.join("target")).unwrap();
 
     let resumed = run(&plan, journal_dir.path()).unwrap();
     assert_eq!(resumed.failed, 1, "relaxing the mtime check must not relax the inode check");
@@ -358,7 +361,7 @@ fn a_dry_run_checks_everything_and_changes_nothing() {
         }
     }
 
-    let opts = ExecOptions { dry_run: true, fault: None };
+    let opts = ExecOptions { dry_run: true, ..Default::default() };
     let outcome = execute(&plan, journal_dir.path(), &opts, &Control::new(), None).unwrap();
 
     assert_eq!(outcome.done, 3);
@@ -386,7 +389,7 @@ fn a_dry_run_still_catches_an_entry_that_changed() {
     fs::remove_file(root.join("lonely.tmp")).unwrap();
     fs::write(root.join("lonely.tmp"), vec![0u8; 3]).unwrap();
 
-    let opts = ExecOptions { dry_run: true, fault: None };
+    let opts = ExecOptions { dry_run: true, ..Default::default() };
     let outcome = execute(&plan, journal_dir.path(), &opts, &Control::new(), None).unwrap();
     assert_eq!(outcome.failed, 1, "a dry run that misses this is worthless as a rehearsal");
 }
@@ -418,26 +421,33 @@ fn nested_deletions_run_deepest_first() {
     assert!(freed[0] > 0, "the deeper operation should have removed something");
 }
 
+/// Deletions and moves in one plan, which is the normal case once both exist.
 #[test]
-fn moves_are_refused_until_they_are_implemented() {
+fn a_plan_can_mix_moves_and_deletions() {
     let fixture = fixture();
     let root = fixture.path();
     let journal_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(root.join("archive")).unwrap();
 
     let mut plan = Plan::new(root.to_path_buf());
-    plan.ops = vec![Op::Move {
-        src: root.join("cache"),
-        dst: root.join("moved"),
-        ident: Ident::of(&root.join("cache")).unwrap(),
-        est_bytes: 0,
-        on_conflict: Conflict::Fail,
-    }];
+    plan.ops = vec![
+        delete_op(&root.join("logs")),
+        Op::Move {
+            src: root.join("cache"),
+            dst: root.join("archive/cache"),
+            ident: Ident::of(&root.join("cache")).unwrap(),
+            est_bytes: 0,
+            on_conflict: Conflict::Fail,
+        },
+    ];
 
-    let err = run(&plan, journal_dir.path()).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    assert!(root.join("cache").exists(), "the plan was refused, so nothing should have happened");
-    // Refused before anything was written, so there is no half-started run to resume.
-    assert_eq!(state(journal_dir.path()).unwrap(), RunState::NotStarted);
+    let outcome = run(&plan, journal_dir.path()).unwrap();
+
+    assert_eq!(outcome.done, 2, "{outcome:?}");
+    assert_eq!(outcome.failed, 0);
+    assert!(!root.join("logs").exists());
+    assert!(root.join("archive/cache/blob").exists(), "the move did not arrive");
+    assert_eq!(state(journal_dir.path()).unwrap(), RunState::Finished);
 }
 
 #[test]
@@ -455,7 +465,7 @@ fn run_state_tracks_the_journal() {
             Ok(())
         }
     };
-    let opts = ExecOptions { dry_run: false, fault: Some(&hook) };
+    let opts = ExecOptions { fault: Some(&hook), ..Default::default() };
     execute(&plan, journal_dir.path(), &opts, &Control::new(), None).unwrap_err();
     assert_eq!(state(journal_dir.path()).unwrap(), RunState::Interrupted);
 

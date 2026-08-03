@@ -6,6 +6,7 @@
 //! journal on disk is whatever actually reached it. That is the situation the design exists for.
 
 use std::collections::BTreeSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -53,6 +54,24 @@ impl Scene {
             let path = self.root.join(name);
             plan.ops.push(Op::Delete { ident: Ident::of(&path).unwrap(), path, est_bytes: 0 });
         }
+        Store::at(self.state.join("plans")).save(&plan).unwrap();
+        plan.id
+    }
+
+    /// A plan that moves `logs/` to `dst`, and its id.
+    fn save_move_plan(&self, dst: &Path) -> String {
+        use ccdu_core::plan::store::Store;
+        use ccdu_core::plan::{Conflict, Ident, Op, Plan};
+
+        let src = self.root.join("logs");
+        let mut plan = Plan::new(self.root.clone());
+        plan.ops.push(Op::Move {
+            ident: Ident::of(&src).unwrap(),
+            src,
+            dst: dst.to_path_buf(),
+            est_bytes: 0,
+            on_conflict: Conflict::Fail,
+        });
         Store::at(self.state.join("plans")).save(&plan).unwrap();
         plan.id
     }
@@ -216,4 +235,69 @@ fn a_plan_whose_target_changed_is_refused_before_anything_runs() {
     assert!(stderr.contains("changed since staging"), "{stderr}");
     assert!(stderr.contains("nothing was changed"), "{stderr}");
     assert_eq!(scene.entries(), before, "a refused plan still deleted something");
+}
+
+/// The dangerous window for a move is between publishing the copy and reclaiming the original:
+/// stop there and the data exists twice, which is recoverable — stop anywhere earlier and it must
+/// still exist at the source. This aborts the real binary at each boundary and checks both.
+#[test]
+fn an_aborted_cross_filesystem_move_never_leaves_the_data_nowhere() {
+    let Some(base) = std::env::var_os("CCDU_TEST_OTHER_FS").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: set CCDU_TEST_OTHER_FS to a directory on another filesystem");
+        return;
+    };
+
+    for (i, point) in
+        ["after_op_begin", "mid_copy", "before_source_removal", "before_op_done"].iter().enumerate()
+    {
+        let scene = scene();
+        let dest = base.join(format!("ccdu-move-{}-{i}", std::process::id()));
+        std::fs::create_dir_all(&dest).unwrap();
+
+        if std::fs::metadata(&scene.root).unwrap().dev() == std::fs::metadata(&dest).unwrap().dev()
+        {
+            eprintln!("skipped: CCDU_TEST_OTHER_FS is on the same filesystem");
+            return;
+        }
+
+        let id = scene.save_move_plan(&dest.join("logs"));
+
+        scene
+            .ccdu()
+            .args(["apply", &id, "--yes", "--allow-outside"])
+            .env("CCDU_FAULT", format!("{point}:0"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+
+        // Whatever happened, the data is somewhere complete.
+        let at_source = scene.root.join("logs/2026/0.log").exists();
+        let at_dest = dest.join("logs/2026/0.log").exists();
+        assert!(at_source || at_dest, "after aborting at {point} the data is nowhere");
+
+        let resumed = scene.ccdu().args(["resume", &id]).output().unwrap();
+        assert!(
+            resumed.status.success(),
+            "resume failed after {point}: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+
+        assert!(!scene.root.join("logs").exists(), "after {point} the source was left behind");
+        assert_eq!(
+            std::fs::read(dest.join("logs/2026/0.log")).unwrap().len(),
+            20_000,
+            "after {point} the moved file is not intact"
+        );
+        // No temporary survives a completed move.
+        let leftovers: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".ccdu-part"))
+            .collect();
+        assert!(leftovers.is_empty(), "after {point}, left behind {leftovers:?}");
+
+        std::fs::remove_dir_all(&dest).ok();
+    }
 }

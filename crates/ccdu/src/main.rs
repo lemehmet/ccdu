@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use ccdu_core::exec::journal::Event;
-use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, FaultFn, FaultPoint};
+use ccdu_core::exec::{self, Control, ExecEvent, ExecOptions, FaultFn, FaultPoint, Verify};
 use ccdu_core::format::{format_time, human_size};
 use ccdu_core::model::{flags, NodeId, Tree, ROOT};
 use ccdu_core::plan::store::Store;
@@ -53,6 +53,10 @@ enum Command {
         /// Permit operations on paths outside the scanned tree.
         #[arg(long)]
         allow_outside: bool,
+        /// How hard to check a copied file before its original is removed. `hash` re-reads both
+        /// sides and compares digests.
+        #[arg(long, value_enum, default_value_t = VerifyArg::Size)]
+        verify: VerifyArg,
     },
 
     /// Continue a plan that was paused or interrupted.
@@ -79,6 +83,23 @@ enum PlanCmd {
     /// Delete a saved plan. Removes the plan, never the files it names.
     #[command(alias = "remove")]
     Rm { id: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum VerifyArg {
+    /// Lengths must match. Catches the truncation an interrupted copy leaves.
+    Size,
+    /// Read both copies back and compare digests.
+    Hash,
+}
+
+impl From<VerifyArg> for Verify {
+    fn from(v: VerifyArg) -> Verify {
+        match v {
+            VerifyArg::Size => Verify::Size,
+            VerifyArg::Hash => Verify::Hash,
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -112,10 +133,10 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Scan(args)) => report(args),
         Some(Command::Plan { cmd }) => plan_command(cmd),
-        Some(Command::Apply { id, dry_run, yes, allow_outside }) => {
-            apply(&id, dry_run, yes, allow_outside, false)
+        Some(Command::Apply { id, dry_run, yes, allow_outside, verify }) => {
+            apply(&id, dry_run, yes, allow_outside, verify.into(), false)
         }
-        Some(Command::Resume { id }) => apply(&id, false, true, false, true),
+        Some(Command::Resume { id }) => apply(&id, false, true, false, Verify::Size, true),
         Some(Command::Status { id }) => status(&id),
         None => browse(cli.scan),
     }
@@ -174,7 +195,14 @@ fn describe(state: exec::RunState) -> &'static str {
     }
 }
 
-fn apply(id: &str, dry_run: bool, yes: bool, allow_outside: bool, resuming: bool) -> Result<()> {
+fn apply(
+    id: &str,
+    dry_run: bool,
+    yes: bool,
+    allow_outside: bool,
+    verify: Verify,
+    resuming: bool,
+) -> Result<()> {
     let store = Store::open_default();
     let plan = store.load(id).with_context(|| format!("loading plan {id}"))?;
     let dir = store.dir_for(id)?;
@@ -243,7 +271,7 @@ fn apply(id: &str, dry_run: bool, yes: bool, allow_outside: bool, resuming: bool
             }
         });
 
-        let exec_opts = ExecOptions { dry_run, fault: fault.as_ref().map(|f| f.as_ref()) };
+        let exec_opts = ExecOptions { dry_run, verify, fault: fault.as_ref().map(|f| f.as_ref()) };
         let result = exec::execute(&plan, &dir, &exec_opts, &control, Some(&tx));
         drop(tx);
         finished.store(true, Ordering::Relaxed);
@@ -285,6 +313,9 @@ fn confirm(plan: &ccdu_core::plan::Plan) -> Result<bool> {
         plan.root.display(),
         human_size(plan.delete_bytes())
     );
+    if plan.move_bytes() > 0 {
+        println!("{} will be moved.", human_size(plan.move_bytes()));
+    }
     println!("This cannot be undone.");
     print!("Continue? [y/N] ");
     std::io::stdout().flush()?;
@@ -304,6 +335,8 @@ fn fault_from_env() -> Option<Box<FaultFn<'static>>> {
         "before_op_begin" => FaultPoint::BeforeOpBegin,
         "after_op_begin" => FaultPoint::AfterOpBegin,
         "mid_delete" => FaultPoint::MidDelete,
+        "mid_copy" => FaultPoint::MidCopy,
+        "before_source_removal" => FaultPoint::BeforeSourceRemoval,
         "before_op_done" => FaultPoint::BeforeOpDone,
         "after_op_done" => FaultPoint::AfterOpDone,
         _ => return None,
