@@ -341,6 +341,34 @@ real binary at every journal boundary of every operation, resumes, and demands a
 tree byte-identical to a run that was never interrupted — plus a `SIGKILL` case
 where not even the abort handler runs.
 
+## Where this has actually run
+
+Worth knowing, since ccdu deletes and moves files and filesystems differ in ways that matter here.
+
+**Exercised, on every change:** Linux on ext4 and tmpfs, macOS on APFS, both in CI. That includes
+cross-filesystem moves against a real second filesystem on each platform — sparse files, hardlink
+preservation, interrupted copies — and a harness that kills the process at every journal boundary
+and requires the resumed result to match an uninterrupted run.
+
+**Not yet run in anger:**
+
+- **btrfs and XFS reflinks.** The `FICLONE` path is written and reasoned about — btrfs subvolumes
+  give `EXDEV` on rename while still sharing a filesystem, which is the case it exists for — but it
+  has never executed on either. This is the most likely place for a surprise, and it is on the move
+  path.
+- **ZFS**, where compression and `st_blocks` interact in ways that will probably make the reported
+  numbers disagree with `du`.
+- **Network filesystems.** The journal's durability rests on `fsync`, and the safety check rests on
+  device and inode numbers being stable. Both are shakier over NFS and friends.
+- **Case-insensitive APFS**, where two names can refer to one file in a way the duplicate and move
+  logic has not considered.
+
+If you are on one of these, your report is genuinely wanted rather than a bother — that list exists
+so you know the ground has not been walked, not to warn you off. The failure modes to expect are
+"the numbers look wrong" or "it refused something it should have allowed", rather than data loss:
+ccdu refuses by default and stops when reality does not match what was staged, and that posture does
+not depend on the filesystem.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for the model, what ccdu writes and where, and the
@@ -351,9 +379,20 @@ asked for.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: anything destructive
-needs a test that proves it *refuses* when it should, errors beat silence, and
-dependencies are argued for rather than added.
+**Bug reports and contributions are welcome.** This is a new project that has been used far more by
+its author than by anyone else, so the most valuable thing you can send is what happened when you
+pointed it at a real disk — especially one on a filesystem from the list above, or one big and messy
+enough to be interesting. [Open an issue](https://github.com/lemehmet/ccdu/issues/new/choose); the
+templates ask for the few details that make a report diagnosable rather than a guess.
+
+Anything that defeats staging, validation or the identity checks should go to
+[Security ▸ Report a vulnerability](https://github.com/lemehmet/ccdu/security/advisories/new)
+instead, privately.
+
+For code, see [CONTRIBUTING.md](CONTRIBUTING.md). The short version: anything destructive needs a
+test that proves it *refuses* when it should, errors beat silence, and dependencies are argued for
+rather than added. Small fixes and documentation are as welcome as features — and if you are not
+sure whether something is worth raising, raise it.
 
 ```sh
 cargo test
