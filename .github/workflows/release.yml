@@ -31,7 +31,26 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo build --release --target ${{ matrix.target }} --bin ccdu
+      # A shipped binary should not carry the path it was built from. Without this, every panic
+      # location in the program and its dependencies embeds the builder's home directory — 98 of
+      # them in the first release build that was checked. Cargo's own `trim-paths` would do this,
+      # but it is still unstable, so the flags are passed here where the environment is known.
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin ccdu
+        env:
+          RUSTFLAGS: >-
+            --remap-path-prefix=${{ github.workspace }}=/ccdu
+            --remap-path-prefix=${{ runner.temp }}=/tmp
+            --remap-path-prefix=/Users/runner=/build
+            --remap-path-prefix=/home/runner=/build
+
+      - name: Confirm no build paths survived
+        run: |
+          binary=target/${{ matrix.target }}/release/ccdu
+          if strings -a "$binary" | grep -E '/(home|Users)/runner'; then
+            echo "::error::the binary carries the build machine's paths"
+            exit 1
+          fi
 
       # Built natively on each platform rather than cross-compiled: ccdu is a program made almost
       # entirely of syscalls, and the version that ships should be the one the tests ran against.

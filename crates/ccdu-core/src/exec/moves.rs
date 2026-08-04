@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
-    fchmod, fchown, fsync, ftruncate, futimens, linkat, mkdirat, openat, readlinkat,
-    renameat, seek, statat, symlinkat, unlinkat, AtFlags, Dir, FileType, Gid, Mode, OFlags,
-    SeekFrom, Stat, Timestamps, Uid, CWD,
+    fchmod, fchown, fsync, ftruncate, futimens, linkat, mkdirat, openat, readlinkat, renameat,
+    seek, statat, symlinkat, unlinkat, AtFlags, Dir, FileType, Gid, Mode, OFlags, SeekFrom, Stat,
+    Timestamps, Uid, CWD,
 };
 use rustix::io::{read, write, Errno};
 
