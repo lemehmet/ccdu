@@ -1,7 +1,8 @@
 # Contributing to ccdu
 
-Thanks for your interest. ccdu deletes and moves people's files, which shapes
-most of the decisions below.
+Thanks for your interest — contributions and bug reports are both welcome, and a report from a
+filesystem ccdu has never run on is worth as much as a patch. ccdu deletes and moves people's files,
+which shapes most of the decisions below.
 
 ## Dev setup
 
