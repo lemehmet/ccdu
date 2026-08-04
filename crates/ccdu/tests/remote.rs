@@ -235,3 +235,64 @@ fn a_stale_identity_stops_a_remote_commit() {
     assert_eq!(outcome.failed, 1, "a changed file was removed anyway: {outcome:?}");
     assert!(target.exists(), "a file we never reviewed was deleted over the wire");
 }
+
+/// A plan staged against a tree from another machine must record *that* machine, and be stored
+/// there. Getting either wrong produces a plan sitting in this machine's store, labelled with this
+/// machine's hostname, naming another machine's paths — which validates clean here and applies to
+/// whatever happens to sit at those paths locally.
+#[test]
+fn a_plan_for_a_remote_tree_belongs_to_the_remote() {
+    let dir = tree_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut command = agent();
+    command.env("CCDU_STATE_DIR", state.path());
+    let mut remote = Remote::connect(command).unwrap();
+
+    let target = dir.path().join("logs");
+    let ident = remote.identify(&[target.display().to_string()]).unwrap()[0].clone().unwrap();
+
+    // Built the way the browser builds one for a remote tree.
+    let mut plan = ccdu_core::plan::Plan::for_host(dir.path().to_path_buf(), remote.host.clone());
+    plan.ops.push(ccdu_core::plan::Op::Delete { path: target, ident, est_bytes: 0 });
+    assert_eq!(plan.host, remote.host);
+
+    let (id, path) = remote.save_plan(&plan).unwrap();
+    assert!(
+        path.starts_with(&state.path().display().to_string()),
+        "the plan was stored somewhere other than the remote's own store: {path}"
+    );
+
+    // The remote's own store has it; this test's process has a different notion of "here".
+    let store = ccdu_core::plan::store::Store::at(state.path().join("plans"));
+    assert_eq!(store.load(&id).unwrap().host, remote.host);
+}
+
+/// The host field is not decoration: validation must refuse a plan belonging to another machine,
+/// even when the paths it names happen to exist here.
+#[test]
+fn a_plan_from_another_host_is_refused_even_when_the_paths_exist_here() {
+    use ccdu_core::plan::{validate, Ident, Op, Plan, Severity, ValidateOptions};
+
+    let dir = tree_fixture();
+    let target = dir.path().join("readme.txt");
+
+    let mut plan = Plan::for_host(dir.path().to_path_buf(), "some-other-machine".to_string());
+    plan.ops.push(Op::Delete {
+        ident: Ident::of(&target).unwrap(),
+        path: target.clone(),
+        est_bytes: 0,
+    });
+
+    let findings = validate(&plan, &ValidateOptions::default());
+    let errors: Vec<&str> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Error)
+        .map(|f| f.message.as_str())
+        .collect();
+
+    assert!(
+        errors.iter().any(|m| m.contains("some-other-machine")),
+        "a plan from another machine validated clean against local files: {findings:?}"
+    );
+    assert!(target.exists());
+}

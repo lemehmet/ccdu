@@ -710,6 +710,12 @@ impl App {
     }
 
     /// What these paths look like now, asked of whichever machine holds them.
+    /// The machine holding these files, when it is not this one.
+    fn remote_host(&self) -> Option<String> {
+        let remote = self.remote.as_ref()?;
+        remote.lock().ok().map(|r| r.host.clone())
+    }
+
     fn identities(&self, paths: &[PathBuf]) -> Result<Vec<Option<Ident>>, String> {
         let Some(remote) = &self.remote else {
             return Ok(paths.iter().map(|p| Ident::of(p).ok()).collect());
@@ -783,7 +789,15 @@ impl App {
     }
 
     pub fn refresh_plan(&mut self) {
-        let mut plan = Plan::new(self.tree.root_path().to_path_buf());
+        // The plan belongs to whichever machine holds the files. Recording this one would defeat
+        // the host check that stops a plan from being run in the wrong place — and where a path
+        // of the same name exists on both, that check is the only thing standing between a remote
+        // plan and the local file it names.
+        let root = self.tree.root_path().to_path_buf();
+        let mut plan = match self.remote_host() {
+            Some(host) => Plan::for_host(root, host),
+            None => Plan::new(root),
+        };
         plan.id = self.plan.id.clone();
 
         // Node order, so a plan reads top-down the way the tree does and two builds of the same
@@ -1055,7 +1069,24 @@ impl App {
         // say so, so the saved plan is not silently smaller than what was reviewed.
         let dropped = plan.normalize();
 
-        match self.store.save(&plan) {
+        // A plan goes where its paths mean something. Writing a remote plan into this machine's
+        // store would leave a file naming another machine's paths, next to plans that name this
+        // one's — and `ccdu apply` here would then be pointed at whatever happens to sit at those
+        // paths locally.
+        let saved = match self.remote.clone() {
+            Some(remote) => {
+                remote.lock().map_err(|_| "the connection is in a bad state".to_string()).and_then(
+                    |mut r| r.save_plan(&plan).map(|(_, path)| path).map_err(|e| e.to_string()),
+                )
+            }
+            None => self
+                .store
+                .save(&plan)
+                .map(|path| path.display().to_string())
+                .map_err(|e| e.to_string()),
+        };
+
+        match saved {
             Ok(path) => {
                 let mut notes = Vec::new();
                 if dropped > 0 {
@@ -1067,13 +1098,15 @@ impl App {
                 if errors > 0 {
                     notes.push(format!("{errors} error{} to resolve", plural(errors)));
                 }
+                if let Some(host) = self.remote_host() {
+                    notes.push(format!("on {host}"));
+                }
                 let extra = if notes.is_empty() {
                     String::new()
                 } else {
                     format!(", {}", notes.join(", "))
                 };
-                self.status =
-                    Some(format!("saved {} ({} ops{extra})", path.display(), plan.ops.len()));
+                self.status = Some(format!("saved {path} ({} ops{extra})", plan.ops.len()));
             }
             Err(e) => self.status = Some(format!("could not save: {e}")),
         }
