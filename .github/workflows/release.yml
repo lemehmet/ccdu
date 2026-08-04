@@ -65,9 +65,16 @@ jobs:
           name="ccdu-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp target/${{ matrix.target }}/release/ccdu "dist/$name/"
-          cp README.md LICENSE "dist/$name/"
+          cp README.md LICENSE CHANGELOG.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
-          shasum -a 256 "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+          # Written from inside dist so the file records a bare name. Recorded as "dist/..." it
+          # verifies only from the directory above the one it ships in, which is nobody's layout.
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+
+      - name: Confirm the checksum verifies where it ships
+        run: |
+          cd dist
+          shasum -a 256 -c "ccdu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
