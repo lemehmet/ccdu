@@ -8,6 +8,10 @@ edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/lemehmet/ccdu"
+homepage = "https://github.com/lemehmet/ccdu"
+authors = ["ccdu contributors"]
+keywords = ["disk-usage", "tui", "ncdu", "cleanup", "duplicates"]
+categories = ["command-line-utilities", "filesystem"]
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

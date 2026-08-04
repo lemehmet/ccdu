@@ -1,42 +1,88 @@
 # ccdu
 
-A terminal disk-usage analyzer that **stages** changes into a reviewable plan and **commits** them
-under an append-only journal, so a commit can be paused, resumed, and survives a crash.
+[![CI](https://github.com/lemehmet/ccdu/actions/workflows/ci.yml/badge.svg)](https://github.com/lemehmet/ccdu/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Think `ncdu`, but you never delete by accident — and `yadu`'s execution model without the browser.
+A terminal disk-usage analyzer that **stages** changes into a reviewable plan and
+**commits** them under an append-only journal — so a commit can be paused,
+resumed, and survives a crash. Single binary, Linux and macOS, no daemon and no
+browser.
 
-## Status
-
-Early development. See the milestone table below.
-
-| # | Deliverable | State |
-|---|---|---|
-| M0 | Workspace skeleton, CI | done |
-| M1 | Scanner, arena tree, hardlink accounting | done |
-| M2 | TUI browser | done |
-| M3 | Staging, plan persistence, validation | done |
-| M4 | Executor: deletes, journal, pause/resume | done |
-| M5 | Moves: same-fs, reflink, cross-device | done |
-| M6 | Treemap panel, duplicate detection | done |
-| M7 | ncdu import/export, SSH agent | done |
-
-## Try it
-
-```sh
-ccdu /some/path              # scan, then browse
-ccdu -x -t8 /                # one filesystem, 8 threads
-ccdu scan --top 30 /usr      # headless: summary + largest entries
-ccdu ssh://server/var        # scan on another machine, browse here
-ccdu /some/path -o dump      # save the scan
-ccdu -f dump                 # browse a saved scan
+```
+ccdu ~/projects
 ```
 
-A long scan can be cut short with `q` — you drop straight into the browser with whatever was
-found so far, marked `[partial scan]` so the totals are not mistaken for the whole picture.
+```
+ ccdu  /home/me/projects  43.5 MiB in 8 items  [2 staged, 8.5 MiB]
+    31.0 MiB  [████████████]  71.2%  archive/
+ D   8.0 MiB  [███         ]  18.4%  build/
+     4.0 MiB  [█           ]   9.2%  .cache/
+ D 516.0 KiB  [            ]   1.2%  node_modules/
+ sort: size▼  size: disk   space mark  d delete  m move  u unstage  p plan  ? help  q quit
+```
+
+Two directories marked for deletion. Nothing has happened yet — `p` reviews the
+plan, `c` commits it.
+
+## Why another one?
+
+|  | acts on | multi-select | duplicates | resumable | remote |
+|---|---|---|---|---|---|
+| `du` / `df` | nothing | — | — | — | — |
+| `ncdu` | deletes on keypress | no | no | no | analysis only |
+| [`yadu`](https://github.com/lemehmet/yadu) | staged plan | yes | no | yes | no |
+| **ccdu** | **staged plan** | **yes** | **yes** | **yes** | **scan and commit** |
+
+Finding what is eating the disk and deciding what to do about it are different
+mental modes, and tools that delete on a keypress force you to hold both at once.
+ccdu separates them: sweep the tree marking things freely, review the whole set
+in one place, then commit it deliberately.
+
+The other half is that committing is not instant. Deleting a few hundred
+thousand files, or moving forty gigabytes to another disk, takes long enough that
+something *will* interrupt it eventually. ccdu treats that as the normal case
+rather than the exception.
+
+[`yadu`](https://github.com/lemehmet/yadu) got the model right and serves its
+treemap over a local HTTP server to a browser — which is exactly wrong for the
+machine where you most need this, a server you reached over ssh. ccdu keeps the
+model and stays in the terminal.
+
+## Install
+
+Prebuilt binaries for Linux and macOS, x86-64 and arm64, are attached to each
+[release](https://github.com/lemehmet/ccdu/releases).
+
+```sh
+cargo install --git https://github.com/lemehmet/ccdu ccdu
+```
+
+### From source
+
+Requires Rust 1.88 or newer.
+
+```sh
+git clone https://github.com/lemehmet/ccdu
+cd ccdu
+cargo build --release      # target/release/ccdu
+```
+
+## Usage
+
+```sh
+ccdu                       # the current directory
+ccdu /var                  # somewhere specific
+ccdu -x /                  # one filesystem only
+ccdu ssh://server/var/log  # another machine
+```
+
+A long scan can be cut short with `q` — you land in the browser with whatever was
+found so far, marked `[partial]` so the totals are not mistaken for the whole
+picture.
 
 ### Keys
 
-| | |
+|  |  |
 |---|---|
 | `↑ ↓ j k`, `PgUp` `PgDn`, `Home` `End` | move |
 | `⏎` `→` `l` / `←` `h` `Backspace` | open a directory / go up |
@@ -44,42 +90,22 @@ found so far, marked `[partial scan]` so the totals are not mistaken for the who
 | `a` | apparent size vs disk usage |
 | `g` | cycle graph: bar, percent, both, off |
 | `t` / `D` | treemap panel / find duplicate files |
-| `Space` | mark an entry; `d`/`m`/`u` then apply to every mark |
+| `Space` | mark an entry; `d` `m` `u` then apply to every mark |
 | `d` / `m` / `u` | stage a deletion / a move / unstage |
-| `p` / `w` / `c` | review the plan / write it to the plan store / commit |
+| `p` / `w` / `c` | review the plan / write it out / commit |
 | `i` / `?` / `q` | details / keys / quit |
 
-## Duplicates and the treemap
+Sizes are `st_blocks * 512` — what freeing the file actually gives back — unless
+you press `a`. Hardlinked files are counted once, so hardlink farms report real
+numbers rather than inflated ones. `ccdu` agrees with `du -s --block-size=1` on
+the trees it has been checked against, at roughly a third of the wall time on
+eight threads.
 
-`t` puts a squarified treemap beside the listing — areas proportional to size, so the thing worth
-deleting is the thing that looks biggest.
+## Staging and committing
 
-`D` finds files with identical contents, in three stages, each shrinking the input to the next:
-group by size (free — the scan already knows every size), hash the first and last few kilobytes
-(a fixed read however large the file), then hash in full whatever survived. Hardlinks are excluded:
-two names for one inode are not two copies.
-
-```
- duplicates   2 groups  14.0 MiB reclaimable
- 3 copies of 6.0 MiB  — 12.0 MiB reclaimable
-   keep work/video-again.mp4
-        media/video.mp4
-        backup/video-copy.mp4
-```
-
-`A` stages every copy in a group except the first. It never stages the whole group: a bulk action
-that could remove the last copy is not a labour saver. A copy that is itself hardlinked elsewhere
-says so and is left out of the reclaimable total, because removing that one name frees nothing.
-
-```sh
-ccdu dupes /some/path --min-size 1048576 --top 5
-```
-
-## Staging
-
-Nothing you do in the browser touches the disk. `d` and `m` record what to do and what the entry
-looked like at the time — device, inode, size, mtime — and `p` shows the result with every problem
-attributed to the operation that caused it:
+Nothing in the browser touches the disk. `d` and `m` record what to do and what
+the entry looked like at that moment — device, inode, size, mtime — and `p` shows
+the result with every problem attributed to the operation that caused it:
 
 ```
  plan  2 operations  reclaims 8.0 MiB  moves 3.0 MiB
@@ -88,36 +114,38 @@ attributed to the operation that caused it:
  D    8.0 MiB  /data/logs
 ```
 
-`w` writes the plan to `$XDG_STATE_HOME/ccdu/plans/<id>/plan.json` (override the location with
-`CCDU_STATE_DIR`). From there:
+`c` asks for confirmation on its own screen, because this is the only
+irreversible thing ccdu does. There is no undo; the review step is the safety.
+
+`w` writes the plan to `$XDG_STATE_HOME/ccdu/plans/<id>/plan.json` instead, for
+running later or from a script:
 
 ```sh
 ccdu plan list                 # newest first
 ccdu plan show <id>
 ccdu plan validate <id>        # exits non-zero if anything blocks a commit
 ccdu plan rm <id>              # removes the plan, never the files it names
+
+ccdu apply <id> --dry-run      # check everything, change nothing, journal nothing
+ccdu apply <id>                # asks first
+ccdu resume <id>               # continue a paused or interrupted run
+ccdu status <id>               # how far it got
 ```
 
-Validation refuses protected system directories and the scan root, operations on paths outside the
-scanned tree, moves into their own subtree, two operations writing the same destination, a
-destination that already exists, a destination filesystem without room, and — the one that matters
-most — any entry whose identity no longer matches what was staged:
+Validation refuses protected system directories and the scan root, paths outside
+the scanned tree, moves into their own subtree, two operations writing the same
+destination, an occupied destination, a destination filesystem without room, and
+— the one that matters most — anything whose identity no longer matches what was
+staged:
 
 ```
 error  #0  changed since staging: modified at 2026-08-03 20:29:54 (was 2026-08-03 20:29:51)
 ```
 
-## Committing
+### Interruptions are the normal case
 
-```sh
-ccdu apply <id> --dry-run    # check everything, change nothing, journal nothing
-ccdu apply <id>              # asks for confirmation first
-ccdu resume <id>             # continue a paused or interrupted run
-ccdu status <id>             # how far it got
-```
-
-Ctrl-C **pauses** rather than kills, leaving a run you can resume instead of a state you have to
-work out. So does a crash — the two are the same thing to the recovery path:
+Ctrl-C **pauses** rather than kills. So does a crash — to the recovery path they
+are the same thing:
 
 ```
 $ ccdu apply 20260803T212000-cafe0002 --yes
@@ -133,53 +161,121 @@ $ ccdu resume 20260803T212000-cafe0002
 1 operations done, 117.9 MiB reclaimed
 ```
 
-The total covers both attempts, because the resumed run can only measure what was left to remove.
+The total covers both attempts, because the resumed run can only measure what was
+left to remove.
 
-Every record reaches disk before the syscall it describes, so the journal can claim work that never
-happened but can never omit work that did — and since each operation re-checks reality and is
-idempotent, a premature claim costs one wasted check rather than a file. Deletion runs through
-`*at` syscalls on a directory descriptor the executor opened itself, so a path swapped mid-run
-cannot redirect it, and an unwritable directory is detected before its contents are gone rather
-than after.
-
-In the browser, `c` opens the plan, and `c` again from there asks for confirmation on its own
-screen — the review step is the safety, so committing is never one keystroke from browsing. A
-commit running in the TUI can be paused with `p` and continued later with `ccdu resume`. Once it
-has run, the listing describes a disk that no longer exists, and says so rather than showing
-numbers that are quietly wrong.
+Every journal record reaches disk before the syscall it describes. The journal
+can therefore claim work that never happened, but can never omit work that did —
+and since every operation re-checks reality and is idempotent, a premature claim
+costs one wasted check rather than a file.
 
 ## Moving
 
 Three paths, cheapest first:
 
-| | |
+|  |  |
 |---|---|
 | **Rename** | Same filesystem: one syscall, atomic, consumes nothing |
 | **Reflink** | Different `st_dev`, same filesystem — btrfs subvolumes, where `rename` gives `EXDEV` but the data can still be shared rather than duplicated |
 | **Copy, verify, unlink** | Different filesystems. In that order, always |
 
-The source is the only copy of the data until the destination is durable and checked, so it is the
-last thing to go. A cross-filesystem move assembles the destination under `.ccdu-part-<n>-<name>`
-and renames it into place only once complete, so a half-copied tree never appears at the
-destination path and an interrupted move resumes into the same temporary instead of starting over.
-A file already there at the right length is skipped; a short one is a torn copy and is redone
-rather than trusted.
+The source is the only copy of the data until the destination is durable and
+checked, so it is the last thing to go. A cross-filesystem move assembles the
+destination under `.ccdu-part-<n>-<name>` and renames it into place only when
+complete, so a half-copied tree never appears at the destination path and an
+interrupted move resumes into the same temporary instead of starting over.
 
-Copies preserve permissions, timestamps, ownership where privileged, symlinks (recreated, not
-followed), and holes — a 64 MiB sparse file arrives sparse. Files hardlinked to each other inside
-the tree arrive as one inode with two names rather than two copies. A socket or device node is
-refused outright: ccdu will not claim to have copied something it cannot reproduce and then delete
-the original.
+Copies preserve permissions, timestamps, ownership where privileged, symlinks
+(recreated, not followed), and holes — a 64 MiB sparse file arrives sparse. Files
+hardlinked to each other inside the tree arrive as one inode with two names. A
+socket or device node is refused outright: ccdu will not claim to have copied
+something it cannot reproduce and then delete the original.
 
-`--verify=hash` re-reads both sides and compares blake3 digests; the default checks lengths, which
-is what an interrupted copy gets wrong.
+`--verify=hash` re-reads both sides and compares blake3 digests; the default
+checks lengths, which is what an interrupted copy gets wrong.
+
+## Duplicates and the treemap
+
+`t` puts a squarified treemap beside the listing — areas proportional to size, so
+the thing worth deleting is the thing that looks biggest.
+
+`D` finds files with identical contents in three stages, each shrinking the input
+to the next: group by size (free, since the scan already knows every size), hash
+the first and last few kilobytes (a fixed read however large the file), then hash
+in full whatever survived.
+
+```
+ duplicates   2 groups  14.0 MiB reclaimable
+ 3 copies of 6.0 MiB  — 12.0 MiB reclaimable
+   keep work/video-again.mp4
+        media/video.mp4
+        backup/video-copy.mp4
+```
+
+`A` stages every copy in a group except the first. It never stages the whole
+group: a bulk action that could remove the last copy is not a labour saver.
+Hardlinks are excluded, since two names for one inode are not two copies, and a
+copy that is itself hardlinked elsewhere says so and is left out of the
+reclaimable total — removing that one name would free nothing.
+
+```sh
+ccdu dupes /some/path --min-size 1048576 --top 5
+```
+
+## Another machine
+
+```sh
+ccdu ssh://server/var/log
+ccdu ssh://me@server:2222/data
+ccdu server:/var/log          # scp-style also works
+```
+
+This runs `ccdu --agent` on the far side over your own ssh: the remote walks the
+filesystem, where the files are, and sends back the finished tree. The connection
+stays open, so staging asks the remote what entries look like — only the machine
+holding a file can say — and committing runs there too.
+
+That siting is the point. The plan and its journal end up on the machine doing
+the work, so a connection dropped mid-commit leaves a run that `ccdu resume`
+finishes *on that host*, rather than a record stranded at the end of a pipe that
+no longer exists.
+
+If the host has no ccdu, it falls back to `ncdu -o-`, which is the common case
+rather than a failure:
+
+```
+$ ccdu ssh://server/var/log
+no ccdu agent on server (the remote said nothing; ccdu may not be installed or on its PATH); trying ncdu
+```
+
+A tree fetched that way is read-only, and says so. Use `--remote-ccdu
+/path/to/ccdu` when it is installed somewhere ssh's non-interactive `PATH` does
+not reach.
+
+## Saving and sharing scans
+
+```sh
+ccdu /usr -o usr.ccdu                      # exact and compact
+ccdu /usr -o - --format ncdu-json | zstd   # readable by `ncdu -f`
+ccdu -f usr.ccdu                           # either format; `-` reads stdin
+```
+
+The format is worked out from the file's first bytes, so it needs neither a flag
+nor a naming convention and works on a pipe. Both readers treat their input as
+untrusted: a file claiming a node's parent lives at index four billion gets an
+error, not a panic somewhere much later.
+
+Interoperability is checked against the real tool rather than against
+assumptions — `ncdu 1.19` and `ccdu` report the same 696.7 MiB and 50 838 items
+for `/usr/share`, in both directions.
 
 ## Configuration
 
-Optional. Everything has a working default, and an empty file behaves exactly like no file.
+Optional. Everything has a working default, and an empty file behaves exactly
+like no file.
 
 ```sh
-ccdu config           # where it is read from, and what it currently says
+ccdu config           # where it is read from, and what it says
 ccdu config --write   # a commented file with every option at its default
 ```
 
@@ -194,8 +290,9 @@ one_file_system = true
 protect = ["/srv/archive", "/home/me/photos"]
 ```
 
-A file that does not parse is an error rather than a silent fallback — a typo in `protect` would
-otherwise leave a directory unprotected while the user believed it was safe:
+A file that does not parse is an error rather than a silent fallback — a typo in
+`protect` would otherwise leave a directory unprotected while you believed it was
+safe:
 
 ```
 Error: loading configuration
@@ -205,65 +302,56 @@ Caused by:
     unknown field `protekt`, expected one of `protect`, `no_default_protection`, `headroom`
 ```
 
-`CCDU_CONFIG` overrides the location.
+`CCDU_CONFIG` overrides the location, `CCDU_STATE_DIR` overrides where plans
+live.
 
-## Running the tests
+## How it works
+
+The scan walks directories across several threads, handing subdirectories to
+workers as open descriptors so each is reached with one `openat` from its parent
+rather than by re-walking its path. A single builder thread owns the tree, so
+nothing is locked on the hot path. Entries land in a flat arena of 48-byte nodes
+with names in one shared buffer, which is what makes a tree of millions of files
+practical to hold and browse.
+
+Execution works through `*at` syscalls on directory descriptors the executor
+opened itself, so nothing substituted mid-run can redirect a deletion, and every
+operation re-checks the identity recorded at staging time before it acts.
+
+The correctness argument is tested rather than asserted: a harness aborts the
+real binary at every journal boundary of every operation, resumes, and demands a
+tree byte-identical to a run that was never interrupted — plus a `SIGKILL` case
+where not even the abort handler runs.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the model, what ccdu writes and where, and the
+deliberate limits. In short: nothing happens until you commit, identity is
+re-checked immediately before acting, system paths are refused, and ccdu makes no
+network connections of any kind — the only process it starts is the `ssh` you
+asked for.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: anything destructive
+needs a test that proves it *refuses* when it should, errors beat silence, and
+dependencies are argued for rather than added.
 
 ```sh
 cargo test
-CCDU_TEST_OTHER_FS=/dev/shm/ccdu-tests cargo test   # also exercises cross-filesystem moves
+CCDU_TEST_OTHER_FS=/dev/shm/ccdu-test cargo test   # also exercises cross-filesystem moves
 ```
 
-The cross-filesystem tests need a directory on a second filesystem. Without one they print that
-they were skipped rather than passing vacuously — so CI provides one on both platforms and fails
-if it turns out not to be a second filesystem after all.
-
-CI runs fmt, clippy and the tests on Linux and macOS, and builds the workspace at the declared
-minimum Rust version. Releases are built natively on each platform rather than cross-compiled:
-ccdu is a program made almost entirely of syscalls, and the binary that ships should be the one
-the tests ran against.
-
-Sizes are `st_blocks * 512` (what freeing the file actually returns) unless you press `a`, and
-hardlinked files are counted once. `ccdu` matches `du -s --block-size=1` on the trees it has been
-checked against, at roughly a third of the wall time on 8 threads.
-
-## Saving, sharing, and other machines
-
-A scan can be written out and read back, in ccdu's own format or ncdu's:
-
-```sh
-ccdu /usr -o usr.ccdu                      # exact and compact
-ccdu /usr -o - --format ncdu-json | zstd   # readable by `ncdu -f`
-ccdu -f usr.ccdu                           # either format; `-` reads stdin
-```
-
-The format is worked out from the file's first bytes, so neither naming conventions nor a flag are
-needed, and it works on a pipe. Both readers treat their input as untrusted: a file claiming a
-node's parent lives at index four billion gets an error, not a panic somewhere much later.
-
-Interoperability is checked against the real thing rather than against assumptions — `ncdu 1.19`
-and `ccdu` report the same 696.7 MiB and 50 838 items for `/usr/share` in both directions.
-
-`ccdu ssh://host/path` runs `ccdu --agent` over ssh: the remote walks the filesystem, where the
-files are, and sends back the finished tree. If that host has no ccdu, it falls back to
-`ncdu -o-` — a host with ncdu on it is the common case, not a failure.
-
-```
-$ ccdu ssh://server/var/log
-no ccdu agent on server (the remote said nothing; ccdu may not be installed or on its PATH); trying ncdu
-```
-
-Use `--remote-ccdu /path/to/ccdu` when it is installed somewhere ssh's non-interactive `PATH` does
-not reach. A tree fetched from another machine is browsable but not stageable — its paths describe
-a filesystem this process cannot safely act on, and it says so rather than failing later.
+The cross-filesystem tests need a directory on a second filesystem. Without one
+they print that they were skipped rather than passing vacuously.
 
 ## Layout
 
-- `crates/ccdu-core` — scanner, tree model, duplicate engine, plan, journal, executor. No UI deps.
-- `crates/ccdu-tui` — ratatui frontend.
-- `crates/ccdu-remote` — SSH agent protocol (both ends).
+- `crates/ccdu-core` — scanner, tree, duplicates, plans, journal, executor. No UI.
+- `crates/ccdu-tui` — the ratatui frontend.
+- `crates/ccdu-remote` — the ssh agent protocol, both ends.
 - `crates/ccdu` — the `ccdu` binary.
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [LICENSE](LICENSE).
