@@ -352,6 +352,10 @@ they print that they were skipped rather than passing vacuously.
 - `crates/ccdu-remote` — the ssh agent protocol, both ends.
 - `crates/ccdu` — the `ccdu` binary.
 
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
