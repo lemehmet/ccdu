@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/lemehmet/ccdu/security/advisories/new
+    about: >-
+      Report privately instead of opening an issue. ccdu deletes and moves files, so anything that
+      defeats staging, validation or the identity checks belongs here.

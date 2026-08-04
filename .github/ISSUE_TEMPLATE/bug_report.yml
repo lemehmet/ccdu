@@ -1,0 +1,57 @@
+name: Bug report
+description: Something ccdu did that it should not have, or did not do that it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. If this involves a commit that went wrong, the journal is the
+        single most useful thing you can attach — it records what was attempted and in what order.
+        **Read it before you post it: it contains the paths it operated on.**
+
+  - type: input
+    id: version
+    attributes:
+      label: ccdu version
+      description: Output of `ccdu --version`
+      placeholder: ccdu 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and filesystem
+      description: >-
+        OS and version, and the filesystem involved. Filesystem matters more than usual here —
+        sparse files, hardlinks, reflinks and directory sizes all behave differently.
+      placeholder: Ubuntu 24.04, ext4 (moving to a tmpfs)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: journal
+    attributes:
+      label: Journal, if a commit was involved
+      description: >-
+        From `~/.local/state/ccdu/plans/<id>/journal.jsonl`, or the macOS equivalent. Redact paths
+        you would rather not share — the sequence of events is usually the useful part.
+      render: json
+
+  - type: checkboxes
+    id: data-loss
+    attributes:
+      label: Did this lose data?
+      options:
+        - label: >-
+            Yes — ccdu removed or moved something it should not have. (These are treated as the
+            highest priority. If it also looks like a security issue, please use Security ▸
+            Report a vulnerability instead of a public issue.)
