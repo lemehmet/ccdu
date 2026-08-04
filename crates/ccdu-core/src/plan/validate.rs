@@ -506,15 +506,32 @@ mod tests {
             est_bytes: 0,
         }];
 
-        // A directory's size does not move when its contents do; the mtime is the signal, and
-        // saying "4.0 KiB -> 4.0 KiB" would be worse than saying nothing.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(target.join("new"), b"x").unwrap();
 
         let found = validate(&plan, &ValidateOptions::default());
         let messages = errors(&found);
-        assert!(messages.iter().any(|m| m.contains("modified at")), "{found:?}");
-        assert!(messages.iter().all(|m| !m.contains("4.0 KiB -> 4.0 KiB")), "{found:?}");
+        assert_eq!(messages.len(), 1, "{found:?}");
+        let message = messages[0];
+        assert!(message.contains("changed since staging"), "{message}");
+
+        // Whichever detail the message reports, the two values must actually differ. The bug this
+        // guards against printed "4.0 KiB -> 4.0 KiB" for a directory whose contents had changed
+        // but whose size had not — which is the case on ext4, where the mtime is the only signal.
+        // On APFS the directory's size does move, so the message legitimately names that instead;
+        // what must never happen is reporting a change by quoting a value against itself.
+        if let Some((before, after)) = message.split_once(" -> ") {
+            // The value before the arrow is the tail of the sentence: take the same number of
+            // words the value after it has, in the order they were written.
+            let words = after.split_whitespace().count();
+            let mut tail: Vec<&str> = before.rsplit(' ').take(words).collect();
+            tail.reverse();
+            assert_ne!(
+                tail.join(" "),
+                after.trim(),
+                "the message reports a change by quoting a value against itself: {message}"
+            );
+        }
     }
 
     #[test]
