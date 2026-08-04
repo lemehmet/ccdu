@@ -50,8 +50,9 @@ model and stays in the terminal.
 
 ## Install
 
-Prebuilt binaries for Linux and macOS, x86-64 and arm64, are attached to each
-[release](https://github.com/lemehmet/ccdu/releases).
+Prebuilt binaries are attached to each
+[release](https://github.com/lemehmet/ccdu/releases): Linux on x86-64 and arm64, macOS on Apple
+Silicon. Intel Macs build from source, which needs nothing but a Rust toolchain.
 
 ```sh
 cargo install --git https://github.com/lemehmet/ccdu ccdu
