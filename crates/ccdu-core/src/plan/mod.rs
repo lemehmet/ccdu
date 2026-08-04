@@ -170,12 +170,23 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// A plan against this machine's own filesystem.
     pub fn new(root: PathBuf) -> Plan {
+        Plan::for_host(root, hostname())
+    }
+
+    /// A plan against `host`'s filesystem.
+    ///
+    /// The host is not a label: validation refuses a plan whose host is not the machine running
+    /// it, because an inode number means nothing elsewhere and a path that happens to exist on
+    /// both would otherwise be acted on here. Anything staged against a tree fetched from
+    /// somewhere else must record where that tree came from.
+    pub fn for_host(root: PathBuf, host: String) -> Plan {
         Plan {
             version: PLAN_VERSION,
             id: new_id(),
             created: now_secs(),
-            host: hostname(),
+            host,
             root,
             ops: Vec::new(),
         }

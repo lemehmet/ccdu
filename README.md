@@ -253,6 +253,23 @@ A tree fetched that way is read-only, and says so. Use `--remote-ccdu
 /path/to/ccdu` when it is installed somewhere ssh's non-interactive `PATH` does
 not reach.
 
+**Both ends must speak the same protocol version.** The agent checks it during the
+handshake and refuses a mismatch outright, rather than failing part way through a
+scan:
+
+```
+Error: remote speaks protocol v2, this build speaks v1
+```
+
+So upgrade both sides together. The version is bumped only when the messages
+change incompatibly, and never silently — a mismatch is always a clear refusal.
+Nothing else about ccdu depends on the versions matching: local use, exports and
+plan files are unaffected.
+
+A plan staged against a remote tree belongs to the remote. It is stored there,
+records that machine as its host, and is refused if run anywhere else — including
+where a path of the same name happens to exist locally.
+
 ## Saving and sharing scans
 
 ```sh
