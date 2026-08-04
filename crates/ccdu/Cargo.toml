@@ -18,9 +18,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-ccdu-core = { path = "../ccdu-core", version = "0.1.0" }
-ccdu-remote = { version = "0.1.0", path = "../ccdu-remote" }
-ccdu-tui = { path = "../ccdu-tui", version = "0.1.0" }
+ccdu-core = { path = "../ccdu-core", version = "0.1.1" }
+ccdu-remote = { version = "0.1.1", path = "../ccdu-remote" }
+ccdu-tui = { path = "../ccdu-tui", version = "0.1.1" }
 clap = { version = "4.6.5", features = ["derive"] }
 crossbeam-channel = "0.5.16"
 libc = "0.2.189"

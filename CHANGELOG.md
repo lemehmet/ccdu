@@ -5,6 +5,28 @@ while the major version is 0, breaking changes may land in a minor release, and 
 export formats carry their own version numbers so a file from a newer ccdu is refused rather than
 half-understood.
 
+## v0.1.1 — 2026-08-04
+
+### Fixed
+
+- **A plan staged against a remote tree belonged to the wrong machine.** Writing a plan with `w`
+  stored it on the local machine even when the tree came from another one, and every plan recorded
+  the local hostname regardless of where its paths lived. Validating such a plan checked the local
+  filesystem, which usually reported the paths as missing — but where a path of the same name
+  existed on both machines, it validated clean and `ccdu apply` acted on the local file. The host
+  check exists to prevent exactly that and could not fire, because the hostname had been taken from
+  the wrong side. Plans are now built with the host that owns their paths and stored where those
+  paths mean something.
+
+  Anyone who saved a remote plan with v0.1.0 should check `ccdu plan list` on the machine they ran
+  it from: any plan there naming another machine's paths was mislabelled, and should be deleted and
+  re-staged.
+
+### Documentation
+
+- The README now covers the agent's protocol version, since a mismatch between the two ends refuses
+  the connection outright and both sides need upgrading together.
+
 ## v0.1.0 — 2026-08-04
 
 First release.
