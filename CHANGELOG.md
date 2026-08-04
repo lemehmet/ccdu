@@ -79,5 +79,5 @@ First release.
 
 ### Platforms
 
-Linux and macOS, x86-64 and arm64. Released binaries are built natively on each target and carry
-no build-machine paths.
+Linux and macOS. Released binaries cover Linux on x86-64 and arm64 and macOS on Apple Silicon,
+built natively on each target and carrying no build-machine paths. Intel Macs build from source.
