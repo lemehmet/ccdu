@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
     fchmod, fchown, fsync, ftruncate, futimens, linkat, mkdirat, openat, readlinkat, renameat,
-    seek, statat, symlinkat, unlinkat, AtFlags, Dir, FileType, Gid, Mode, OFlags, SeekFrom, Stat,
-    Timestamps, Uid, CWD,
+    seek, statat, symlinkat, unlinkat, AtFlags, Dir, Gid, Mode, OFlags, SeekFrom, Stat, Timestamps,
+    Uid, CWD,
 };
 use rustix::io::{read, write, Errno};
 
@@ -656,6 +656,7 @@ fn link_to(existing: &Path, dst_dir: &OwnedFd, name: &CStr) -> Result<(), OpErro
 /// something, so the caller refuses instead.
 #[cfg(target_os = "linux")]
 fn recreate_fifo(parent: &OwnedFd, name: &CStr, stat: &Stat) -> bool {
+    use rustix::fs::FileType;
     if FileType::from_raw_mode(stat.st_mode as _) != FileType::Fifo {
         return false;
     }
