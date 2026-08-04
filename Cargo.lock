@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "ccdu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ccdu-core",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "ccdu-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "ccdu-remote"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ccdu-core",
  "crossbeam-channel",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "ccdu-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ccdu-core",
  "ccdu-remote",
