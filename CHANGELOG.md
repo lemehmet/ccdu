@@ -5,6 +5,20 @@ while the major version is 0, breaking changes may land in a minor release, and 
 export formats carry their own version numbers so a file from a newer ccdu is refused rather than
 half-understood.
 
+## Unreleased
+
+### Fixed
+
+- **On macOS, most of a large tree was reported unreadable.** macOS starts every process with a
+  limit of 256 open files, and the scanner's queue alone was allowed 256 directory descriptors —
+  the whole allowance, before counting the terminal or the directories being read, each of which
+  also cost two. Once the limit was hit, every directory that failed to open was counted as
+  unreadable and its contents dropped: scanning a tree of 1.47 million entries found 29 thousand,
+  with 2,928 directories flagged. ccdu now raises its own soft limit at startup, sizes the queue
+  from whatever limit it actually has, reads each directory through one descriptor instead of two,
+  and treats running out of descriptors as a reason to try that directory again rather than as
+  the directory being unreadable.
+
 ## v0.1.1 — 2026-08-04
 
 ### Fixed
