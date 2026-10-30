@@ -191,6 +191,8 @@ struct ScanArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Before anything scans, here or as a remote agent.
+    ccdu_core::scan::raise_fd_limit();
     if cli.agent {
         // Nothing but frames may reach stdout from here on.
         let stdin = std::io::stdin();

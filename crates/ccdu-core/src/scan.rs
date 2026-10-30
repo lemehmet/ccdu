@@ -12,11 +12,13 @@ use std::ffi::CStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use rustix::fd::OwnedFd;
+use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::fs::{openat, statat, AtFlags, Dir, FileType, Mode, OFlags, Stat, CWD};
 use rustix::io::Errno;
+use rustix::process::{getrlimit, setrlimit, Resource};
 
 use crate::model::{flags, Kind, Meta, NodeId, Tree, ROOT};
 
@@ -35,7 +37,8 @@ pub struct ScanOptions {
     pub exclude_names: Vec<Vec<u8>>,
     /// Upper bound on directory descriptors held open by the queue at once. Beyond this, pending
     /// directories fall back to being reopened by path, which is slower but cannot exhaust the
-    /// process's descriptor limit on very wide trees.
+    /// process's descriptor limit on very wide trees. The scan lowers it further when the
+    /// process's own limit leaves less room than this.
     pub max_open_dirs: usize,
 }
 
@@ -47,7 +50,7 @@ impl Default for ScanOptions {
             threads,
             one_file_system: false,
             exclude_names: Vec::new(),
-            max_open_dirs: 256,
+            max_open_dirs: 4096,
         }
     }
 }
@@ -84,14 +87,17 @@ pub fn scan(
     let ctx = Ctx {
         opts: opts.clone(),
         root_dev: root_meta.dev,
-        budget: FdBudget { count: AtomicUsize::new(0), max: opts.max_open_dirs },
+        budget: FdBudget {
+            count: AtomicUsize::new(0),
+            max: opts.max_open_dirs.min(fd_headroom(opts.threads.max(1))),
+        },
         cancel,
     };
 
     let (task_tx, task_rx) = unbounded::<Task>();
     let (res_tx, res_rx) = unbounded::<DirResult>();
 
-    task_tx.send(Task { id: ROOT, handle: Handle::Path(root.to_path_buf()) }).ok();
+    task_tx.send(Task { id: ROOT, handle: Handle::Path(root.to_path_buf()), attempt: 0 }).ok();
     let mut outstanding = 1usize;
 
     std::thread::scope(|scope| {
@@ -165,6 +171,50 @@ impl Ctx<'_> {
     }
 }
 
+/// Descriptors kept back from the queue for everything else the process has open: stdio, the
+/// terminal, an output file, an ssh pipe.
+const FD_RESERVE: usize = 32;
+
+/// How many times a directory is retried after the process ran out of descriptors before it is
+/// given up as unreadable.
+const MAX_ATTEMPTS: u8 = 8;
+
+/// How many descriptors the queue may hold without starving the workers. Each worker also holds
+/// the directory it is reading, plus one more briefly while opening a child; the budget gets
+/// whatever is left of the process's soft limit after those and [`FD_RESERVE`].
+fn fd_headroom(threads: usize) -> usize {
+    let limit = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    limit.saturating_sub(FD_RESERVE + 2 * threads).max(1)
+}
+
+/// The descriptor limit [`raise_fd_limit`] aims for: room for the default `max_open_dirs` plus
+/// everything else, and below macOS's `OPEN_MAX`, past which `setrlimit` refuses outright.
+const WANTED_FDS: u64 = 8192;
+
+/// Raise the process's soft descriptor limit towards its hard limit, so a wide tree can be walked
+/// by descriptor rather than by path. macOS starts processes at 256, which a scan would otherwise
+/// spend almost entirely on its queue. Never lowers the limit; failure leaves it as it was, which
+/// the scan copes with, only more slowly.
+///
+/// This changes process-wide state, so it is for the binary to call, not something [`scan`] does
+/// behind its caller's back.
+pub fn raise_fd_limit() {
+    let mut limit = getrlimit(Resource::Nofile);
+    let current = limit.current.unwrap_or(u64::MAX);
+    let target = limit.maximum.unwrap_or(u64::MAX).min(WANTED_FDS);
+    if target > current {
+        limit.current = Some(target);
+        setrlimit(Resource::Nofile, limit).ok();
+    }
+}
+
+/// The process is out of descriptors: a condition that clears as other directories finish, not a
+/// property of the directory being opened.
+fn is_fd_exhaustion(e: Errno) -> bool {
+    matches!(e, Errno::MFILE | Errno::NFILE)
+}
+
 /// Caps how many directory descriptors the pending queue holds at once.
 struct FdBudget {
     count: AtomicUsize,
@@ -173,9 +223,18 @@ struct FdBudget {
 
 impl FdBudget {
     fn try_acquire(&self) -> bool {
-        self.count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < self.max).then_some(n + 1))
-            .is_ok()
+        // A plain compare-exchange loop: `fetch_update` is deprecated on current stable, and its
+        // replacement `try_update` is newer than the minimum supported Rust.
+        let mut n = self.count.load(Ordering::Relaxed);
+        loop {
+            if n >= self.max {
+                return false;
+            }
+            match self.count.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(current) => n = current,
+            }
+        }
     }
 
     fn release(&self) {
@@ -193,6 +252,8 @@ enum Handle {
 struct Task {
     id: NodeId,
     handle: Handle,
+    /// How many times this directory has already been put back for lack of descriptors.
+    attempt: u8,
 }
 
 /// How the builder should reach a subdirectory's contents.
@@ -218,13 +279,22 @@ struct DirResult {
     entries: Vec<Entry>,
     /// Reading the directory itself failed or was cut short.
     read_error: bool,
+    /// The directory could not be opened because descriptors ran out; queue it again by path.
+    /// Set only below [`MAX_ATTEMPTS`]; past that the directory is a `read_error` instead.
+    retry: Option<u8>,
     /// This task consumed a descriptor from the budget.
     used_fd: bool,
 }
 
 /// Read one directory: stat every entry, and open the subdirectories we intend to descend into.
 fn read_dir(task: Task, ctx: &Ctx) -> DirResult {
-    let mut out = DirResult { id: task.id, entries: Vec::new(), read_error: false, used_fd: false };
+    let mut out = DirResult {
+        id: task.id,
+        entries: Vec::new(),
+        read_error: false,
+        retry: None,
+        used_fd: false,
+    };
 
     let fd = match task.handle {
         Handle::Fd(fd) => {
@@ -233,18 +303,22 @@ fn read_dir(task: Task, ctx: &Ctx) -> DirResult {
         }
         Handle::Path(path) => match openat(CWD, &path, DIR_FLAGS, Mode::empty()) {
             Ok(fd) => fd,
-            Err(_) => {
-                out.read_error = true;
+            Err(e) => {
+                fail_open(&mut out, e, task.attempt);
                 return out;
             }
         },
     };
 
-    let mut dir = match Dir::read_from(&fd) {
+    // `Dir::new` takes the descriptor over rather than reopening it as `Dir::read_from` does, so a
+    // directory being read costs one descriptor, not two. Entries are stat'd and opened relative to
+    // the same descriptor, which is safe: neither touches the stream's position.
+    let dir = Dir::new(fd);
+    finish_task(&out, ctx);
+    let mut dir = match dir {
         Ok(dir) => dir,
-        Err(_) => {
-            out.read_error = true;
-            finish_task(&out, ctx);
+        Err(e) => {
+            fail_open(&mut out, e, task.attempt);
             return out;
         }
     };
@@ -268,10 +342,16 @@ fn read_dir(task: Task, ctx: &Ctx) -> DirResult {
         if name == c"." || name == c".." {
             continue;
         }
+        // Borrowed afresh for each entry, since the stream is borrowed mutably by `read` between
+        // them. It is a field read, not a system call.
+        let Ok(fd) = dir.fd() else {
+            out.read_error = true;
+            break;
+        };
 
         let excluded = ctx.opts.exclude_names.iter().any(|e| e == name.to_bytes());
 
-        let (meta, err) = match statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        let (meta, err) = match statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => (meta_from_stat(&st), false),
             Err(_) => (Meta::unknown(kind_of(entry.file_type())), true),
         };
@@ -281,7 +361,7 @@ fn read_dir(task: Task, ctx: &Ctx) -> DirResult {
         if meta.kind == Kind::Dir && !err && !excluded {
             let foreign = ctx.opts.one_file_system && meta.dev != ctx.root_dev;
             if !foreign {
-                descend = open_child(&fd, name, ctx, &mut open_failed);
+                descend = open_child(fd, name, ctx, &mut open_failed);
             }
         }
 
@@ -294,18 +374,29 @@ fn read_dir(task: Task, ctx: &Ctx) -> DirResult {
         });
     }
 
-    finish_task(&out, ctx);
     out
 }
 
+/// Record a directory that could not be opened: unreadable, unless descriptors merely ran out and
+/// it has retries left.
+fn fail_open(out: &mut DirResult, e: Errno, attempt: u8) {
+    if is_fd_exhaustion(e) && attempt + 1 < MAX_ATTEMPTS {
+        // Give the other workers a moment to close what they hold before this comes round again.
+        std::thread::sleep(Duration::from_millis(1 << attempt));
+        out.retry = Some(attempt + 1);
+    } else {
+        out.read_error = true;
+    }
+}
+
 /// Open a subdirectory, degrading to a reopen-by-path when descriptors are scarce.
-fn open_child(dir_fd: &OwnedFd, name: &CStr, ctx: &Ctx, open_failed: &mut bool) -> Descend {
+fn open_child(dir_fd: BorrowedFd, name: &CStr, ctx: &Ctx, open_failed: &mut bool) -> Descend {
     if !ctx.budget.try_acquire() {
         return Descend::Reopen;
     }
     match openat(dir_fd, name, DIR_FLAGS, Mode::empty()) {
         Ok(fd) => Descend::Fd(fd),
-        Err(Errno::MFILE) | Err(Errno::NFILE) => {
+        Err(e) if is_fd_exhaustion(e) => {
             ctx.budget.release();
             Descend::Reopen
         }
@@ -317,6 +408,8 @@ fn open_child(dir_fd: &OwnedFd, name: &CStr, ctx: &Ctx, open_failed: &mut bool) 
     }
 }
 
+/// Return the task's descriptor to the budget. The descriptor itself now belongs to the `Dir` (or
+/// was closed by its failure), so the budget stops counting it once it is no longer queued.
 fn finish_task(out: &DirResult, ctx: &Ctx) {
     if out.used_fd {
         ctx.budget.release();
@@ -349,6 +442,12 @@ impl<'a> Builder<'a> {
     /// Insert one directory's entries and queue any subdirectories. Returns how many new tasks
     /// were enqueued so the caller can track outstanding work.
     fn absorb(&mut self, tree: &mut Tree, result: DirResult, task_tx: &Sender<Task>) -> usize {
+        if let Some(attempt) = result.retry {
+            let path = tree.path_of(result.id);
+            task_tx.send(Task { id: result.id, handle: Handle::Path(path), attempt }).ok();
+            return 1;
+        }
+
         self.dirs += 1;
         if result.read_error {
             tree.add_flags(result.id, flags::ERR);
@@ -390,7 +489,7 @@ impl<'a> Builder<'a> {
                 Descend::No => {}
                 Descend::Fd(fd) => {
                     if fresh {
-                        task_tx.send(Task { id, handle: Handle::Fd(fd) }).ok();
+                        task_tx.send(Task { id, handle: Handle::Fd(fd), attempt: 0 }).ok();
                         queued += 1;
                     } else {
                         drop(fd);
@@ -401,7 +500,7 @@ impl<'a> Builder<'a> {
                 Descend::Reopen => {
                     if fresh {
                         let path = tree.path_of(id);
-                        task_tx.send(Task { id, handle: Handle::Path(path) }).ok();
+                        task_tx.send(Task { id, handle: Handle::Path(path), attempt: 0 }).ok();
                         queued += 1;
                     } else {
                         tree.add_flags(id, flags::LOOP);
@@ -597,6 +696,44 @@ mod tests {
 
         assert_eq!(found.keys().filter(|k| k.ends_with("/f")).count(), 40);
         assert_eq!(tree.errors, 0);
+    }
+
+    #[test]
+    fn running_out_of_descriptors_is_retried_not_unreadable() {
+        let fresh = || DirResult {
+            id: ROOT,
+            entries: Vec::new(),
+            read_error: false,
+            retry: None,
+            used_fd: false,
+        };
+
+        let mut out = fresh();
+        fail_open(&mut out, Errno::MFILE, 0);
+        assert_eq!(out.retry, Some(1));
+        assert!(!out.read_error);
+
+        // Retries are bounded, so a limit too small to ever succeed still ends the scan.
+        let mut out = fresh();
+        fail_open(&mut out, Errno::NFILE, MAX_ATTEMPTS - 1);
+        assert_eq!(out.retry, None);
+        assert!(out.read_error);
+
+        // A genuinely unreadable directory is not retried at all.
+        let mut out = fresh();
+        fail_open(&mut out, Errno::ACCESS, 0);
+        assert_eq!(out.retry, None);
+        assert!(out.read_error);
+    }
+
+    #[test]
+    fn budget_leaves_room_under_the_process_limit() {
+        let limit = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+        let headroom = fd_headroom(8) as u64;
+        assert!(headroom >= 1);
+        if limit > FD_RESERVE as u64 {
+            assert!(headroom < limit, "the queue alone could exhaust the descriptor limit");
+        }
     }
 
     #[test]
