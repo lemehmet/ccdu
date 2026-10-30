@@ -223,9 +223,18 @@ struct FdBudget {
 
 impl FdBudget {
     fn try_acquire(&self) -> bool {
-        self.count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < self.max).then_some(n + 1))
-            .is_ok()
+        // A plain compare-exchange loop: `fetch_update` is deprecated on current stable, and its
+        // replacement `try_update` is newer than the minimum supported Rust.
+        let mut n = self.count.load(Ordering::Relaxed);
+        loop {
+            if n >= self.max {
+                return false;
+            }
+            match self.count.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(current) => n = current,
+            }
+        }
     }
 
     fn release(&self) {
