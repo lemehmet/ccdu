@@ -5,7 +5,7 @@ while the major version is 0, breaking changes may land in a minor release, and 
 export formats carry their own version numbers so a file from a newer ccdu is refused rather than
 half-understood.
 
-## Unreleased
+## v0.2.0 — 2026-10-29
 
 ### Fixed
 
@@ -18,6 +18,20 @@ half-understood.
   from whatever limit it actually has, reads each directory through one descriptor instead of two,
   and treats running out of descriptors as a reason to try that directory again rather than as
   the directory being unreadable.
+
+### Library
+
+- `ccdu_core::scan::raise_fd_limit()` raises the process's soft descriptor limit. `scan()` does not
+  call it itself, since it changes process-wide state; embedders that want the same headroom as the
+  `ccdu` binary should call it once at startup.
+- `ScanOptions::max_open_dirs` now defaults to 4096 and is treated as a ceiling: the scan lowers it
+  to fit the descriptor limit the process actually has.
+
+### Documentation
+
+- The README lists the filesystems ccdu has been run on and, more usefully, the ones it has not —
+  btrfs and XFS reflinks, ZFS, network filesystems, case-insensitive APFS — and asks for reports
+  from them.
 
 ## v0.1.1 — 2026-08-04
 
